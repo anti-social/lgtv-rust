@@ -2,21 +2,20 @@
 
 use failure::{Error, format_err};
 
-use futures::{Future, select, SinkExt, StreamExt};
-use futures::sink::Sink;
+use futures::{Future, select, Sink, SinkExt, Stream, StreamExt};
 use futures::channel::oneshot;
+use futures::io::{AsyncRead, AsyncWrite};
+use futures::stream::FusedStream;
 
 use async_std::future::timeout;
-use async_std::net::TcpStream;
-use async_std::sync::{channel, Sender};
+use async_std::sync::{channel, Sender, Receiver};
 use async_std::task;
 
-use async_tls::client::TlsStream;
-
 use async_tungstenite::{connect_async, WebSocketStream};
-use async_tungstenite::stream::Stream;
 
-use tungstenite::error::{Error as WSError};
+use log::{info, trace};
+
+use tungstenite::error::{Error as WsError, Result as WsResult};
 use tungstenite::protocol::Message;
 
 use serde_json::{self, json};
@@ -25,14 +24,15 @@ use std::time::Duration;
 
 use url::Url;
 
-//use wakey::WolPacket;
+// use wakey::WolPacket;
 
 mod scan;
 pub use scan::scan;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const PAIRING: &'static str = include_str!("pairing.json");
-// const MAC_ADDR: &'static str = "cc:2d:8c:cf:c4:3e";
 
 const AUDIO_URI: &str = "ssap://audio";
 const SYSTEM_URI: &str = "ssap://system";
@@ -44,6 +44,7 @@ fn mk_uri(base: &str, cmd: &str) -> String {
 
 #[derive(Debug)]
 pub enum TvCmd {
+    // WaitConn(oneshot::Sender<Result<(), Error>>),
     TurnOff(oneshot::Sender<Result<(), Error>>),
     OpenChannel(u8, oneshot::Sender<Result<(), Error>>),
     GetVolume(oneshot::Sender<Result<u8, Error>>),
@@ -178,96 +179,97 @@ impl TvCmd {
     }
 }
 
-pub struct Lgtv {
-    _url: Url,
-    read_timeout: Option<Duration>,
-    cmd_tx: Sender<TvCmd>,
-//    ws_tx: SplitSink<WebSocketStream<Stream<TcpStream, TlsStream<TcpStream>>>, Message>,
-//    ws_resp_tx: Sender<(String, oneshot::Sender<Option<Result<serde_json::Value, Error>>>)>
-}
-
-#[derive(Clone, Copy)]
-pub struct LgtvBuilder {
+struct PersistentConn {
+    url: Url,
+    client_key: String,
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
 }
 
-struct CmdContext<S: Sink<Message>> {
-    waiting_cmds: HashMap<String, TvCmd>,
-    cmd_count: u64,
-    ws_tx: S,
-}
+impl PersistentConn {
+    async fn start(
+        url: Url,
+        client_key: String,
+        connect_timeout: Option<Duration>,
+        read_timeout: Option<Duration>,
+        wait_connection: bool,
+        cmd_rx: Receiver<TvCmd>,
+    ) -> Arc<AtomicBool> {
+        let mut cmd_rx = cmd_rx.fuse();
 
-impl<S: Sink<Message> + Unpin> CmdContext<S> {
-    fn new(ws_tx: S) -> CmdContext<S> {
-         CmdContext {
-             waiting_cmds: HashMap::new(),
-             cmd_count: 0,
-             ws_tx,
-         }
-    }
+        let conn = PersistentConn {
+            url,
+            client_key,
+            connect_timeout,
+            read_timeout,
+        };
 
-    async fn process_cmd(&mut self, cmd: TvCmd) {
-        let json_cmd = cmd.prepare(self.cmd_count);
-        self.cmd_count += 1;
-        let msg_id = json_cmd["id"].as_str().unwrap();
-        self.waiting_cmds.insert(msg_id.to_string(), cmd);
-        let send_res = self.ws_tx.send(
-            dbg!(Message::text(json_cmd.to_string()))
-        ).await;
-        if let Err(_) = send_res {
-            self.waiting_cmds.remove(msg_id);
-        }
-    }
+        let (mut wait_conn_tx, wait_conn_rx) = if wait_connection {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
-    async fn process_msg(&mut self, msg: Result<Message, WSError>) {
-        match msg {
-            Ok(Message::Text(resp)) => {
-                let fut = serde_json::from_str::<serde_json::Value>(&resp)
-                .ok()
-                .and_then(|resp| {
-                    resp["id"].as_str()
-                    .and_then(|id| {
-                        self.waiting_cmds.remove(id)
-                    })
-                    .map(|cmd| async {
-                        cmd.process(Ok(resp)).await;
-                    })
-                })
-                .map(|fut| fut);
-                if let Some(fut) = fut {
-                    fut.await;
+        let is_connected = Arc::new(AtomicBool::new(false));
+        let ret = is_connected.clone();
+
+        trace!("Starting persistent connection ...");
+        task::spawn(async move {
+            loop {
+                trace!("Connecting to {} ...", &conn.url);
+                let ws_stream = match conn.connect().await {
+                    Ok(ws_stream) => {
+                        is_connected.store(true, Ordering::Relaxed);
+                        wait_conn_tx.take().map(|tx| tx.send(()).ok());
+                        ws_stream
+                    },
+                    Err(e) => {
+                        info!("Connection error: {}", e);
+                        task::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    },
+                };
+                let (ws_tx, _ws_rx) = ws_stream.split();
+                let ws_rx = _ws_rx.fuse();
+                cmd_rx = match Conn::start(ws_tx, ws_rx, cmd_rx).await {
+                    ConnExitStatus::Reconnect(cmd_rx) => {
+                        trace!("Reconnecting ...");
+                        is_connected.store(false, Ordering::Relaxed);
+                        cmd_rx
+                    },
+                    ConnExitStatus::Finish => break,
                 }
             }
-            Ok(Message::Ping(data)) => {
-                self.ws_tx.send(Message::Pong(data)).await.ok();
-            }
-            Ok(_) => {}
-            Err(_) => {}
+        });
+
+        if let Some(wait_conn_rx) = wait_conn_rx {
+            wait_conn_rx.await.ok();
         }
-    }
-}
 
-impl LgtvBuilder {
-    pub fn connect_timeout(&mut self, timeout: Duration) -> &mut LgtvBuilder {
-        self.connect_timeout = Some(timeout);
-        self
+        ret
     }
 
-    pub fn read_timeout(&mut self, timeout: Duration) -> &mut LgtvBuilder {
-        self.read_timeout = Some(timeout);
-        self
+    async fn connect(
+        &self,
+    ) -> Result<WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>, Error> {
+        let (mut ws_stream, _) = if let Some(conn_timeout) = self.connect_timeout {
+            timeout(conn_timeout, connect_async(self.url.clone())).await??
+        } else {
+            connect_async(self.url.clone()).await?
+        };
+        self.pair(&mut ws_stream).await?;
+        Ok(ws_stream)
     }
 
     async fn pair(
         &self,
-        ws_stream: &mut WebSocketStream<Stream<TcpStream, TlsStream<TcpStream>>>,
-        client_key: &str,
+        ws_stream: &mut WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>,
     ) -> Result<(), Error> {
         let mut pairing_json: serde_json::Value = serde_json::from_str(PAIRING)?;
         pairing_json["payload"].as_object_mut()
             .ok_or(format_err!("Corrupted pairing.json file"))?
-            .insert("client-key".to_string(), serde_json::Value::String(client_key.to_string()));
+            .insert("client-key".to_string(), serde_json::Value::String(self.client_key.clone()));
         let pairing_msg = Message::text(pairing_json.to_string());
 
         ws_stream.send(pairing_msg).await?;
@@ -284,69 +286,179 @@ impl LgtvBuilder {
             Err(format_err!("Connection was closed"))
         }
     }
+}
 
-    pub async fn connect(self, url: &str, client_key: &str) -> Result<Lgtv, Error> {
-        let url = Url::parse(url)?;
-        let (mut ws_stream, _) = if let Some(connect_timeout) = self.connect_timeout {
-            timeout(connect_timeout, connect_async(url.clone())).await??
-        } else {
-            connect_async(url.clone()).await?
+enum ConnExitStatus<T> {
+    Reconnect(T),
+    Finish,
+}
+
+struct Conn<S, R>
+    where S: Sink<Message>,
+          R: Stream<Item = WsResult<Message>>,
+{
+    ws_tx: S,
+    ws_rx: R,
+    cmd_count: u64,
+    waiting_cmds: HashMap<String, TvCmd>,
+}
+
+impl<S, R> Conn<S, R>
+    where S: Sink<Message> + Send + Unpin + 'static,
+          R: Stream<Item = WsResult<Message>> + FusedStream + Send + Unpin + 'static,
+{
+    fn start<CMD>(
+        ws_tx: S, ws_rx: R, mut cmd_rx: CMD
+    ) -> task::JoinHandle<ConnExitStatus<CMD>>
+        where CMD: Stream<Item = TvCmd> + FusedStream + Send + Unpin + 'static
+    {
+        let mut conn = Conn {
+            ws_tx,
+            ws_rx,
+            cmd_count: 0,
+            waiting_cmds: HashMap::new(),
         };
-        self.pair(&mut ws_stream, client_key).await?;
-
-        let (ws_tx, _ws_rx) = ws_stream.split();
-        let mut ws_rx = _ws_rx.fuse();
-
-        let (cmd_tx, _cmd_rx) = channel::<TvCmd>(1);
-        let mut cmd_rx = _cmd_rx.fuse();
 
         task::spawn(async move {
-            let mut ctx = CmdContext::new(ws_tx);
             loop {
                 select! {
                     cmd = cmd_rx.next() => {
-                        dbg!(&cmd);
+                        trace!("Received command: {:?}", &cmd);
                         match cmd {
                             Some(cmd) => {
-                                ctx.process_cmd(cmd).await;
+                                conn.process_cmd(cmd).await;
                             }
                             None => {
-                                dbg!("Stop processing");
-                                break;
+                                trace!("Finish processing");
+                                break ConnExitStatus::Finish;
                             }
                         }
                     }
-                    msg = ws_rx.next() => {
-                        dbg!(&msg);
+                    msg = conn.ws_rx.next() => {
+                        trace!("Received message: {:?}", msg);
                         match msg {
-                            Some(msg) => {
-                                ctx.process_msg(msg).await;
+                            Some(Ok(msg)) => {
+                                conn.process_msg(msg).await;
+                            }
+                            Some(Err(WsError::ConnectionClosed)) => {
+                                trace!("Connection closed");
+                                break ConnExitStatus::Reconnect(cmd_rx);
+                            }
+                            Some(Err(_)) => {
+                                // TODO error processing
+                                break ConnExitStatus::Reconnect(cmd_rx);
                             }
                             None => {
-                                dbg!("Websocket closed");
-                                break;
+                                trace!("Websocket dropped");
+                                break ConnExitStatus::Finish;
                             }
                         }
                     }
+                };
+            }
+        })
+    }
+
+    async fn process_cmd(&mut self, cmd: TvCmd) {
+        let json_cmd = cmd.prepare(self.cmd_count);
+        self.cmd_count += 1;
+        let msg_id = json_cmd["id"].as_str().unwrap();
+        self.waiting_cmds.insert(msg_id.to_string(), cmd);
+        let send_res = self.ws_tx.send(
+            dbg!(Message::text(json_cmd.to_string()))
+        ).await;
+        if let Err(_) = send_res {
+            self.waiting_cmds.remove(msg_id);
+        }
+    }
+
+    async fn process_msg(&mut self, msg: Message) {
+        match msg {
+            Message::Text(resp) => {
+                let fut = serde_json::from_str::<serde_json::Value>(&resp)
+                    .ok()
+                    .and_then(|resp| {
+                        resp["id"].as_str()
+                            .and_then(|id| {
+                                self.waiting_cmds.remove(id)
+                            })
+                            .map(|cmd| async {
+                                cmd.process(Ok(resp)).await;
+                            })
+                    })
+                    .map(|fut| fut);
+                if let Some(fut) = fut {
+                    fut.await;
                 }
             }
-        });
+            Message::Ping(data) => {
+                self.ws_tx.send(Message::Pong(data)).await.ok();
+            }
+            msg => {
+                trace!("Unsupported websocket message type: {}", msg);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct LgtvBuilder {
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    wait_connection: bool,
+}
+
+impl LgtvBuilder {
+    pub fn connect_timeout(&mut self, timeout: Duration) -> &mut LgtvBuilder {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    pub fn read_timeout(&mut self, timeout: Duration) -> &mut LgtvBuilder {
+        self.read_timeout = Some(timeout);
+        self
+    }
+
+    pub fn wait_connection(&mut self, wait_conn: bool) -> &mut LgtvBuilder {
+        self.wait_connection = wait_conn;
+        self
+    }
+
+    pub async fn connect(self, url: &str, client_key: &str) -> Result<Lgtv, Error> {
+        let url = Url::parse(url)?;
+        let (cmd_tx, cmd_rx) = channel::<TvCmd>(1);
+
+        let is_connected = PersistentConn::start(
+            url.clone(),
+            client_key.to_string(),
+            self.connect_timeout,
+            self.read_timeout,
+            self.wait_connection,
+            cmd_rx
+        ).await;
 
         Ok(Lgtv {
             _url: url,
             read_timeout: self.read_timeout,
             cmd_tx,
+            is_connected,
         })
     }
 }
 
+pub struct Lgtv {
+    _url: Url,
+    read_timeout: Option<Duration>,
+    cmd_tx: Sender<TvCmd>,
+    is_connected: Arc<AtomicBool>,
+}
+
 impl Lgtv {
     pub fn builder() -> LgtvBuilder {
-        LgtvBuilder {
-            connect_timeout: None,
-            read_timeout: None,
-        }
+        LgtvBuilder::default()
     }
+
+//    pub fn close(self) {}
 
     pub async fn turn_off(&mut self) -> Result<(), Error> {
         self.send_cmd(TvCmd::turn_off()).await
@@ -384,9 +496,19 @@ impl Lgtv {
         &mut self,
         rx_fut_and_cmd: (impl Future<Output = Result<Result<T, Error>, oneshot::Canceled>>, TvCmd)
     ) -> Result<T, Error> {
+        if !self.is_connected.load(Ordering::Relaxed) {
+            return Err(format_err!("Not connected"));
+        }
         let (cmd_res_rx, cmd) = rx_fut_and_cmd;
-        self.cmd_tx.send(cmd).await;
-        let res = cmd_res_rx.await;
+        let res_fut = async {
+            self.cmd_tx.send(cmd).await;
+            cmd_res_rx.await
+        };
+        let res = if let Some(read_timeout) = self.read_timeout {
+            timeout(read_timeout, res_fut).await?
+        } else {
+            res_fut.await
+        };
         res.map_err(|e| format_err!("Canceled channel: {}", e))?
     }
 }
@@ -400,9 +522,11 @@ mod tests {
     const CLIENT_KEY: &str = "0b85eb0d4f4a9a5b29e2f32c2f469eb5";
 
     async fn connect(url: &str) -> Lgtv {
+        env_logger::init();
         Lgtv::builder()
-            .connect_timeout(Duration::from_secs(1))
+            .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(1))
+            .wait_connection(true)
             .connect(url, CLIENT_KEY).await
             .expect(&format!("Cannot connect to {}", url))
     }
@@ -436,16 +560,18 @@ mod tests {
 
     #[async_std::test]
     async fn get_inputs() {
+        println!("Connecting ...");
         let mut tv = connect(URL).await;
+        println!("Sending command ...");
         let inputs = tv.get_inputs().await.expect("Error when sending a command");
         println!("{:?}", inputs);
     }
 
-    #[async_std::test]
-    async fn switch_input() {
-        let mut tv = connect(URL).await;
-        tv.switch_input("HDMI_3").await.expect("Cannot send command");
-    }
+//    #[async_std::test]
+//    async fn switch_input() {
+//        let mut tv = connect(URL).await;
+//        tv.switch_input("HDMI_3").await.expect("Cannot send command");
+//    }
 
 //    #[test]
 //    fn volume_up() {
