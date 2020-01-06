@@ -1,0 +1,24 @@
+[package]
+name = "lgtv"
+version = "0.1.0"
+authors = ["Alexander Koval <kovalidis@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# websocket = "0.24.0"
+
+async-tungstenite = "0.2"
+tungstenite = "0.9"
+async-std = { version = "1.4", features = ["unstable"] }
+async-tls = "0.6"
+futures = "0.3"
+url = "2.1"
+
+failure = "0.1"
+serde_json = "1.0"
+wakey = "0.1"
+
+[dev-dependencies]
+async-std = { version = "1.4", features = ["attributes"] }
