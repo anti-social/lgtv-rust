@@ -1,12 +1,12 @@
 use failure::{Error, format_err};
 
 use futures::{select, Sink, SinkExt, Stream, StreamExt};
-use futures::channel::oneshot;
+use futures::channel::{mpsc, oneshot};
 use futures::io::{AsyncRead, AsyncWrite};
 use futures::stream::FusedStream;
 
 use async_std::future::timeout;
-use async_std::sync::Receiver;
+use async_std::sync::{channel, Receiver, Sender};
 use async_std::task;
 
 use async_tungstenite::{connect_async, WebSocketStream};
@@ -43,7 +43,7 @@ impl PersistentConn {
         client_key: String,
         connect_timeout: Option<Duration>,
         read_timeout: Option<Duration>,
-        wait_connection: bool,
+        mut wait_conn_rx: Receiver<oneshot::Sender<()>>,
         cmd_rx: Receiver<TvCmd>,
     ) -> Arc<AtomicBool> {
         let mut cmd_rx = cmd_rx.fuse();
@@ -55,15 +55,11 @@ impl PersistentConn {
             read_timeout,
         };
 
-        let (mut wait_conn_tx, wait_conn_rx) = if wait_connection {
-            let (tx, rx) = oneshot::channel();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
         let is_connected = Arc::new(AtomicBool::new(false));
+        let is_connected_check = is_connected.clone();
         let ret = is_connected.clone();
+
+        let (mut conn_waiters_tx, mut conn_waiters_rx) = mpsc::unbounded::<oneshot::Sender<()>>();
 
         trace!("Starting persistent connection ...");
         task::spawn(async move {
@@ -71,8 +67,18 @@ impl PersistentConn {
                 trace!("Connecting to {} ...", &conn.url);
                 let ws_stream = match conn.connect().await {
                     Ok(ws_stream) => {
+                        trace!("Connected to {}", &conn.url);
                         is_connected.store(true, Ordering::Relaxed);
-                        wait_conn_tx.take().map(|tx| tx.send(()).ok());
+                        loop {
+                            match conn_waiters_rx.try_next() {
+                                Ok(Some(ch)) => {
+                                    ch.send(()).ok();
+                                },
+                                Err(_) => break,
+                                Ok(None) => {}
+                            }
+                        }
+                        // wait_conn_tx.send(()).await;
                         ws_stream
                     },
                     Err(e) => {
@@ -94,9 +100,20 @@ impl PersistentConn {
             }
         });
 
-        if let Some(wait_conn_rx) = wait_conn_rx {
-            wait_conn_rx.await.ok();
-        }
+        task::spawn(async move {
+            loop {
+                match wait_conn_rx.next().await {
+                    Some(ch) => {
+                        if is_connected_check.load(Ordering::Relaxed) {
+                            ch.send(()).ok();
+                        } else {
+                            conn_waiters_tx.send(ch).await.ok();
+                        }
+                    }
+                    None => break
+                }
+            }
+        });
 
         ret
     }

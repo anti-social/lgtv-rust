@@ -8,6 +8,7 @@ use serde_json::{self, json};
 const AUDIO_URI: &str = "ssap://audio";
 const SYSTEM_URI: &str = "ssap://system";
 const TV_URI: &str = "ssap://tv";
+const NETWORK_INPUT_URI: &str = "ssap://com.webos.service.networkinput";
 
 fn mk_uri(base: &str, cmd: &str) -> String {
     format!("{}/{}", base, cmd)
@@ -24,6 +25,8 @@ pub enum TvCmd {
     VolumeDown(oneshot::Sender<Result<(), Error>>),
     GetInputs(oneshot::Sender<Result<Vec<String>, Error>>),
     SwitchInput(String, oneshot::Sender<Result<(), Error>>),
+
+    GetPointerInputSocket(oneshot::Sender<Result<serde_json::Value, Error>>),
 }
 
 type CmdChannelResult<T> = Result<Result<T, Error>, oneshot::Canceled>;
@@ -69,6 +72,11 @@ impl TvCmd {
         (res_rx, TvCmd::SwitchInput(input.to_string(), res_tx))
     }
 
+    pub fn get_pointer_input_socket() -> (impl Future<Output = CmdChannelResult<serde_json::Value>>, TvCmd) {
+        let (res_tx, res_rx) = oneshot::channel();
+        (res_rx, TvCmd::GetPointerInputSocket(res_tx))
+    }
+
     pub(crate) fn prepare(&self, counter: u64) -> serde_json::Value {
         use TvCmd::*;
         use serde_json::*;
@@ -101,6 +109,9 @@ impl TvCmd {
             }
             VolumeDown(_) => {
                 (AUDIO_URI, "volumeDown", None)
+            }
+            GetPointerInputSocket(_) => {
+                (NETWORK_INPUT_URI, "getPointerInputSocket", None)
             }
         };
 
@@ -145,6 +156,9 @@ impl TvCmd {
                     })
                     .map(|l| l as u8);
                 ch.send(level).ok();
+            }
+            GetPointerInputSocket(ch) => {
+                ch.send(resp).ok();
             }
         }
     }

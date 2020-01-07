@@ -29,7 +29,6 @@ pub use scan::scan;
 pub struct LgtvBuilder {
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
-    wait_connection: bool,
 }
 
 impl LgtvBuilder {
@@ -43,27 +42,25 @@ impl LgtvBuilder {
         self
     }
 
-    pub fn wait_connection(&mut self, wait_conn: bool) -> &mut LgtvBuilder {
-        self.wait_connection = wait_conn;
-        self
-    }
-
     pub async fn connect(self, url: &str, client_key: &str) -> Result<Lgtv, Error> {
         let url = Url::parse(url)?;
         let (cmd_tx, cmd_rx) = channel::<TvCmd>(1);
+
+        let (wait_conn_tx, wait_conn_rx) = channel(1);
 
         let is_connected = PersistentConn::start(
             url.clone(),
             client_key.to_string(),
             self.connect_timeout,
             self.read_timeout,
-            self.wait_connection,
+            wait_conn_rx,
             cmd_rx
         ).await;
 
         Ok(Lgtv {
             _url: url,
             read_timeout: self.read_timeout,
+            wait_conn_tx,
             cmd_tx,
             is_connected,
         })
@@ -73,6 +70,7 @@ impl LgtvBuilder {
 pub struct Lgtv {
     _url: Url,
     read_timeout: Option<Duration>,
+    wait_conn_tx: Sender<oneshot::Sender<()>>,
     cmd_tx: Sender<TvCmd>,
     is_connected: Arc<AtomicBool>,
 }
@@ -84,40 +82,50 @@ impl Lgtv {
 
 //    pub fn close(self) {}
 
-    pub async fn turn_off(&mut self) -> Result<(), Error> {
+    pub async fn wait_conn(&self) {
+        let (conn_tx, conn_rx) = oneshot::channel();
+        self.wait_conn_tx.send(conn_tx).await;
+        conn_rx.await.ok();
+    }
+
+    pub async fn turn_off(&self) -> Result<(), Error> {
         self.send_cmd(TvCmd::turn_off()).await
     }
 
-    pub async fn open_channel(&mut self, num: u8) -> Result<(), Error> {
+    pub async fn open_channel(&self, num: u8) -> Result<(), Error> {
         self.send_cmd(TvCmd::open_channel(num)).await
     }
 
-    pub async fn get_inputs(&mut self) -> Result<Vec<String>, Error> {
+    pub async fn get_inputs(&self) -> Result<Vec<String>, Error> {
         self.send_cmd(TvCmd::get_inputs()).await
     }
 
-    pub async fn switch_input(&mut self, input: &str) -> Result<(), Error> {
+    pub async fn switch_input(&self, input: &str) -> Result<(), Error> {
         self.send_cmd(TvCmd::switch_input(input)).await
     }
 
-    pub async fn get_volume(&mut self) -> Result<u8, Error> {
+    pub async fn get_volume(&self) -> Result<u8, Error> {
         self.send_cmd(TvCmd::get_volume()).await
     }
 
-    pub async fn set_volume(&mut self, level: u8) -> Result<(), Error> {
+    pub async fn set_volume(&self, level: u8) -> Result<(), Error> {
         self.send_cmd(TvCmd::set_volume(level)).await
     }
 
-    pub async fn volume_up(&mut self) -> Result<(), Error> {
+    pub async fn volume_up(&self) -> Result<(), Error> {
         self.send_cmd(TvCmd::volume_up()).await
     }
 
-    pub async fn volume_down(&mut self) -> Result<(), Error> {
+    pub async fn volume_down(&self) -> Result<(), Error> {
         self.send_cmd(TvCmd::volume_down()).await
     }
 
+    pub async fn get_pointer_input_socket(&self) -> Result<serde_json::Value, Error> {
+        self.send_cmd(TvCmd::get_pointer_input_socket()).await
+    }
+
     async fn send_cmd<T>(
-        &mut self,
+        &self,
         rx_fut_and_cmd: (impl Future<Output = Result<Result<T, Error>, oneshot::Canceled>>, TvCmd)
     ) -> Result<T, Error> {
         if !self.is_connected.load(Ordering::Relaxed) {
@@ -150,7 +158,6 @@ mod tests {
         Lgtv::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(1))
-            .wait_connection(true)
             .connect(url, CLIENT_KEY).await
             .expect(&format!("Cannot connect to {}", url))
     }
@@ -185,10 +192,13 @@ mod tests {
     #[async_std::test]
     async fn get_inputs() {
         println!("Connecting ...");
-        let mut tv = connect(URL).await;
+        let tv = connect(URL).await;
+        tv.wait_conn().await;
         println!("Sending command ...");
         let inputs = tv.get_inputs().await.expect("Error when sending a command");
         println!("{:?}", inputs);
+        let mouse_socket = tv.get_pointer_input_socket().await.unwrap();
+        println!("{:?}", mouse_socket);
     }
 
 //    #[async_std::test]
