@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cmd::TvCmd;
+use futures::lock::Mutex;
 
 const PAIRING: &'static str = include_str!("pairing.json");
 
@@ -61,7 +62,10 @@ impl PersistentConn {
         let is_connected_check = is_connected.clone();
         let ret = is_connected.clone();
 
-        let (mut conn_waiters_tx, mut conn_waiters_rx) = mpsc::unbounded::<oneshot::Sender<()>>();
+        let conn_waiters_tx = Arc::new(Mutex::new(
+            Vec::<oneshot::Sender<()>>::new()
+        ));
+        let conn_waiters_rx = conn_waiters_tx.clone();
 
         task::spawn(async move {
             trace!("Starting persistent connection loop ...");
@@ -70,16 +74,14 @@ impl PersistentConn {
                 let ws_stream = match conn.connect().await {
                     Ok(ws_stream) => {
                         info!("Connected to {}", &conn.url);
+
+                        // Notify all who waits for connection
+                        let mut conn_waiters = conn_waiters_rx.lock().await;
                         is_connected.store(true, Ordering::Relaxed);
-                        loop {
-                            match conn_waiters_rx.try_next() {
-                                Ok(Some(ch)) => {
-                                    ch.send(()).ok();
-                                },
-                                Err(_) => break,
-                                Ok(None) => {}
-                            }
+                        for conn_waiter in (*conn_waiters).drain(..) {
+                            conn_waiter.send(()).ok();
                         }
+
                         ws_stream
                     },
                     Err(e) => {
@@ -105,10 +107,11 @@ impl PersistentConn {
             loop {
                 match wait_conn_rx.next().await {
                     Some(ch) => {
+                        let mut conn_waiters = conn_waiters_tx.lock().await;
                         if is_connected_check.load(Ordering::Relaxed) {
                             ch.send(()).ok();
                         } else {
-                            conn_waiters_tx.send(ch).await.ok();
+                            (*conn_waiters).push(ch);
                         }
                     }
                     None => break
