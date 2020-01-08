@@ -3,10 +3,11 @@ use failure::{Error, format_err};
 use futures::{select, Sink, SinkExt, Stream, StreamExt};
 use futures::channel::{mpsc, oneshot};
 use futures::io::{AsyncRead, AsyncWrite};
+use futures::future::{Future, FutureExt};
 use futures::stream::FusedStream;
 
-use async_std::future::timeout;
-use async_std::sync::{channel, Receiver, Sender};
+use async_std::future::{timeout, TimeoutError};
+use async_std::sync::Receiver;
 use async_std::task;
 
 use async_tungstenite::{connect_async, WebSocketStream};
@@ -23,6 +24,7 @@ use std::time::Duration;
 use url::Url;
 
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -61,13 +63,13 @@ impl PersistentConn {
 
         let (mut conn_waiters_tx, mut conn_waiters_rx) = mpsc::unbounded::<oneshot::Sender<()>>();
 
-        trace!("Starting persistent connection ...");
         task::spawn(async move {
+            trace!("Starting persistent connection loop ...");
             loop {
                 trace!("Connecting to {} ...", &conn.url);
                 let ws_stream = match conn.connect().await {
                     Ok(ws_stream) => {
-                        trace!("Connected to {}", &conn.url);
+                        info!("Connected to {}", &conn.url);
                         is_connected.store(true, Ordering::Relaxed);
                         loop {
                             match conn_waiters_rx.try_next() {
@@ -78,12 +80,11 @@ impl PersistentConn {
                                 Ok(None) => {}
                             }
                         }
-                        // wait_conn_tx.send(()).await;
                         ws_stream
                     },
                     Err(e) => {
                         info!("Connection error: {}", e);
-                        task::sleep(Duration::from_secs(1)).await;
+                        task::sleep(Duration::from_secs(10)).await;
                         continue;
                     },
                 };
@@ -91,7 +92,7 @@ impl PersistentConn {
                 let ws_rx = _ws_rx.fuse();
                 cmd_rx = match Conn::start(ws_tx, ws_rx, cmd_rx).await {
                     ConnExitStatus::Reconnect(cmd_rx) => {
-                        trace!("Reconnecting ...");
+                        info!("Disconnected. Trying to reconnect ...");
                         is_connected.store(false, Ordering::Relaxed);
                         cmd_rx
                     },
@@ -161,35 +162,73 @@ enum ConnExitStatus<T> {
     Finish,
 }
 
-struct Conn<S, R>
-    where S: Sink<Message>,
-          R: Stream<Item = WsResult<Message>>,
+struct Conn<S>
+    where S: Sink<Message>
 {
     ws_tx: S,
-    ws_rx: R,
     cmd_count: u64,
     waiting_cmds: HashMap<String, TvCmd>,
 }
 
-impl<S, R> Conn<S, R>
+impl<S> Conn<S>
     where S: Sink<Message> + Send + Unpin + 'static,
-          R: Stream<Item = WsResult<Message>> + FusedStream + Send + Unpin + 'static,
 {
-    fn start<CMD>(
-        ws_tx: S, ws_rx: R, mut cmd_rx: CMD
-    ) -> task::JoinHandle<ConnExitStatus<CMD>>
-        where CMD: Stream<Item = TvCmd> + FusedStream + Send + Unpin + 'static
+    fn start<R, CMD>(
+        ws_tx: S, mut ws_rx: R, mut cmd_rx: CMD
+    ) -> impl Future<Output = ConnExitStatus<CMD>>
+        where R: Stream<Item = WsResult<Message>> + FusedStream + Send + Unpin + 'static,
+              CMD: Stream<Item = TvCmd> + FusedStream + Send + Unpin + 'static,
     {
         let mut conn = Conn {
             ws_tx,
-            ws_rx,
             cmd_count: 0,
             waiting_cmds: HashMap::new(),
         };
 
-        task::spawn(async move {
+        let (mut ping_tx, _ping_rx) = mpsc::channel(1);
+        let mut ping_rx = _ping_rx.fuse();
+        let (close_tx, _close_rx) = oneshot::channel();
+        let mut close_rx = _close_rx.fuse();
+        let ping_task_handle = task::spawn(async move {
+            for ping_counter in 0u64.. {
+                task::sleep(Duration::from_secs(10)).await;
+
+                let (pong_tx, pong_rx) = oneshot::channel();
+                if ping_tx.send((ping_counter, pong_tx)).await.is_err() {
+                    break;
+                }
+                match timeout(Duration::from_secs(10), pong_rx).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(oneshot::Canceled {})) => {
+                        break;
+                    }
+                    Err(TimeoutError {..}) => {
+                        trace!("Did not receive pong message. Connection will be closed");
+                        close_tx.send(()).ok();
+                        break;
+                    }
+                }
+            }
+        });
+
+        let conn_task_handle = task::spawn(async move {
+            let mut waiting_pong = None;
             let exit_status = loop {
                 select! {
+                    _ = close_rx => {
+                        break ConnExitStatus::Reconnect(cmd_rx);
+                    }
+                    ping_rx_data = ping_rx.next() => {
+                        trace!("Pinging");
+                        match ping_rx_data {
+                            Some((ping_counter, pong_tx)) => {
+                                let data = ping_counter.to_be_bytes().to_vec();
+                                conn.ws_tx.send(Message::Ping(data)).await.ok();
+                                waiting_pong = Some((ping_counter, pong_tx));
+                            }
+                            None => {}
+                        }
+                    }
                     cmd = cmd_rx.next() => {
                         trace!("Received command: {:?}", &cmd);
                         match cmd {
@@ -202,22 +241,38 @@ impl<S, R> Conn<S, R>
                             }
                         }
                     }
-                    msg = conn.ws_rx.next() => {
+                    msg = ws_rx.next() => {
                         trace!("Received message: {:?}", msg);
                         match msg {
-                            Some(Ok(msg)) => {
+                            Some(Ok(Message::Text(msg))) => {
                                 conn.process_msg(msg).await;
+                            }
+                            Some(Ok(Message::Binary(_))) => {
+                                trace!("Received a binary message. Ignoring it")
+                            }
+                            Some(Ok(Message::Ping(data))) => {
+                                conn.ws_tx.send(Message::Pong(data)).await.ok();
+                            }
+                            Some(Ok(Message::Pong(data))) => {
+                                trace!("Received a pong message");
+                                conn.process_pong(data, waiting_pong.take());
+                            }
+                            Some(Ok(Message::Close(_))) => {
+                                info!("Received close message. Closing connection");
+                                break ConnExitStatus::Reconnect(cmd_rx);
                             }
                             Some(Err(WsError::ConnectionClosed)) => {
                                 trace!("Connection closed");
                                 break ConnExitStatus::Reconnect(cmd_rx);
                             }
-                            Some(Err(_)) => {
-                                // TODO error processing
+                            Some(Err(e)) => {
+                                trace!("Received error: {}", e);
+                                // TODO Error processing
                                 break ConnExitStatus::Reconnect(cmd_rx);
                             }
                             None => {
                                 trace!("Websocket dropped");
+                                // TODO Should we send a close message?
                                 break ConnExitStatus::Finish;
                             }
                         }
@@ -228,7 +283,27 @@ impl<S, R> Conn<S, R>
                 cmd.process(Err(format_err!("Connection closed")));
             }
             exit_status
-        })
+        });
+
+        ping_task_handle.then(|_| conn_task_handle)
+    }
+
+    fn process_pong(&self, data: Vec<u8>, waiting_pong: Option<(u64, oneshot::Sender<()>)>) {
+        if let Some((ping_counter, pong_tx)) = waiting_pong {
+            let (counter_bytes, _) = data.split_at(std::mem::size_of::<u64>());
+            if let Ok(counter_arr) = counter_bytes.try_into() {
+                let pong_counter = u64::from_be_bytes(counter_arr);
+                if ping_counter == pong_counter {
+                    pong_tx.send(()).ok();
+                } else {
+                    info!("Pong message with outdated counter: {}", pong_counter);
+                }
+            } else {
+                info!("Cannot convert pong data to counter");
+            }
+        } else {
+            info!("Unknown pong message");
+        }
     }
 
     async fn process_cmd(&mut self, cmd: TvCmd) {
@@ -237,34 +312,24 @@ impl<S, R> Conn<S, R>
         let msg_id = json_cmd["id"].as_str().unwrap();
         self.waiting_cmds.insert(msg_id.to_string(), cmd);
         let send_res = self.ws_tx.send(
-            dbg!(Message::text(json_cmd.to_string()))
+            Message::text(json_cmd.to_string())
         ).await;
         if let Err(_) = send_res {
             self.waiting_cmds.remove(msg_id);
         }
     }
 
-    async fn process_msg(&mut self, msg: Message) {
-        match msg {
-            Message::Text(resp) => {
-                serde_json::from_str::<serde_json::Value>(&resp)
-                    .ok()
-                    .and_then(|resp| {
-                        resp["id"].as_str()
-                            .and_then(|id| {
-                                self.waiting_cmds.remove(id)
-                            })
-                            .map(|cmd| {
-                                cmd.process(Ok(resp));
-                            })
-                    });
-            }
-            Message::Ping(data) => {
-                self.ws_tx.send(Message::Pong(data)).await.ok();
-            }
-            msg => {
-                trace!("Unsupported websocket message type: {}", msg);
-            }
-        }
+    async fn process_msg(&mut self, msg: String) {
+        serde_json::from_str::<serde_json::Value>(&msg)
+            .ok()
+            .and_then(|resp| {
+                resp["id"].as_str()
+                    .and_then(|id| {
+                        self.waiting_cmds.remove(id)
+                    })
+                    .map(|cmd| {
+                        cmd.process(Ok(resp));
+                    })
+            });
     }
 }
