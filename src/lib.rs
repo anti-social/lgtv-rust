@@ -147,6 +147,7 @@ impl Lgtv {
 
 #[cfg(test)]
 mod tests {
+    use async_std::future::timeout;
     use std::time::Duration;
     use crate::Lgtv;
 
@@ -155,11 +156,13 @@ mod tests {
 
     async fn connect(url: &str) -> Lgtv {
         env_logger::init();
-        Lgtv::builder()
+        let tv = Lgtv::builder()
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(1))
+            .read_timeout(Duration::from_secs(5))
             .connect(url, CLIENT_KEY).await
-            .expect(&format!("Cannot connect to {}", url))
+            .expect(&format!("Cannot connect to {}", url));
+        timeout(Duration::from_secs(5), tv.wait_conn()).await.expect("Cannot connect");
+        tv
     }
 
 //    #[async_std::test]
@@ -193,7 +196,6 @@ mod tests {
     async fn get_inputs() {
         println!("Connecting ...");
         let tv = connect(URL).await;
-        tv.wait_conn().await;
         println!("Sending command ...");
         let inputs = tv.get_inputs().await.expect("Error when sending a command");
         println!("{:?}", inputs);

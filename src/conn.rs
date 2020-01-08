@@ -4,6 +4,7 @@ use futures::{select, Sink, SinkExt, Stream, StreamExt};
 use futures::channel::{mpsc, oneshot};
 use futures::io::{AsyncRead, AsyncWrite};
 use futures::future::{Future, FutureExt};
+use futures::lock::Mutex;
 use futures::stream::FusedStream;
 
 use async_std::future::{timeout, TimeoutError};
@@ -29,7 +30,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cmd::TvCmd;
-use futures::lock::Mutex;
 
 const PAIRING: &'static str = include_str!("pairing.json");
 
@@ -240,6 +240,7 @@ impl<S> Conn<S>
                             }
                             None => {
                                 trace!("Finish processing");
+                                conn.ws_tx.send(Message::Close(None)).await.ok();
                                 break ConnExitStatus::Finish;
                             }
                         }
@@ -261,11 +262,10 @@ impl<S> Conn<S>
                                 conn.process_pong(data, waiting_pong.take());
                             }
                             Some(Ok(Message::Close(_))) => {
-                                info!("Received close message. Closing connection");
-                                break ConnExitStatus::Reconnect(cmd_rx);
+                                trace!("Received close message");
                             }
                             Some(Err(WsError::ConnectionClosed)) => {
-                                trace!("Connection closed");
+                                info!("Connection closed");
                                 break ConnExitStatus::Reconnect(cmd_rx);
                             }
                             Some(Err(e)) => {
@@ -274,8 +274,7 @@ impl<S> Conn<S>
                                 break ConnExitStatus::Reconnect(cmd_rx);
                             }
                             None => {
-                                trace!("Websocket dropped");
-                                // TODO Should we send a close message?
+                                trace!("Websocket dropped?");
                                 break ConnExitStatus::Finish;
                             }
                         }
