@@ -4,6 +4,7 @@ use failure::{Error, format_err};
 
 use futures::Future;
 use futures::channel::oneshot;
+use futures::sink::SinkExt;
 
 use async_std::future::timeout;
 use async_std::sync::{channel, Sender};
@@ -18,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // use wakey::WolPacket;
 
 mod cmd;
-pub use cmd::TvCmd;
+use cmd::{InputCmd, TvCmd};
 mod conn;
 use conn::PersistentConn;
 mod scan;
@@ -44,35 +45,25 @@ impl LgtvBuilder {
 
     pub async fn connect(self, url: &str, client_key: &str) -> Result<Lgtv, Error> {
         let url = Url::parse(url)?;
-        let (cmd_tx, cmd_rx) = channel::<TvCmd>(1);
 
-        let (wait_conn_tx, wait_conn_rx) = channel(1);
-
-        let is_connected = PersistentConn::start(
+        let conn = PersistentConn::start(
             url.clone(),
             client_key.to_string(),
             self.connect_timeout,
             self.read_timeout,
-            wait_conn_rx,
-            cmd_rx
         ).await;
 
         Ok(Lgtv {
-            _url: url,
-            read_timeout: self.read_timeout,
-            wait_conn_tx,
-            cmd_tx,
-            is_connected,
+            conn,
         })
     }
 }
 
 pub struct Lgtv {
-    _url: Url,
-    read_timeout: Option<Duration>,
-    wait_conn_tx: Sender<oneshot::Sender<()>>,
-    cmd_tx: Sender<TvCmd>,
-    is_connected: Arc<AtomicBool>,
+    conn: PersistentConn,
+//    wait_conn_tx: Sender<oneshot::Sender<()>>,
+//    cmd_tx: Sender<TvCmd>,
+//    is_connected: Arc<AtomicBool>,
 }
 
 impl Lgtv {
@@ -84,7 +75,8 @@ impl Lgtv {
 
     pub async fn wait_conn(&self) {
         let (conn_tx, conn_rx) = oneshot::channel();
-        self.wait_conn_tx.send(conn_tx).await;
+        let mut wait_conn_tx = self.conn.wait_conn_tx.clone();
+        wait_conn_tx.send(conn_tx).await;
         conn_rx.await.ok();
     }
 
@@ -120,28 +112,51 @@ impl Lgtv {
         self.send_cmd(TvCmd::volume_down()).await
     }
 
-    pub async fn get_pointer_input_socket(&self) -> Result<serde_json::Value, Error> {
+    pub async fn get_pointer_input_socket(&self) -> Result<Url, Error> {
         self.send_cmd(TvCmd::get_pointer_input_socket()).await
+    }
+
+    pub async fn send_button(&self, key: &str) -> Result<(), Error> {
+        self.send_pointer_cmd(InputCmd::Button(key.to_string())).await
     }
 
     async fn send_cmd<T>(
         &self,
         rx_fut_and_cmd: (impl Future<Output = Result<Result<T, Error>, oneshot::Canceled>>, TvCmd)
     ) -> Result<T, Error> {
-        if !self.is_connected.load(Ordering::Relaxed) {
+        if !self.conn.is_connected.load(Ordering::Relaxed) {
             return Err(format_err!("Not connected"));
         }
+        let mut cmd_tx = self.conn.cmd_tx.clone();
         let (cmd_res_rx, cmd) = rx_fut_and_cmd;
         let res_fut = async {
-            self.cmd_tx.send(cmd).await;
+            cmd_tx.send(cmd).await;
             cmd_res_rx.await
         };
-        let res = if let Some(read_timeout) = self.read_timeout {
+        let res = if let Some(read_timeout) = self.conn.read_timeout {
             timeout(read_timeout, res_fut).await?
         } else {
             res_fut.await
         };
         res.map_err(|e| format_err!("Canceled channel: {}", e))?
+    }
+
+    async fn send_pointer_cmd(
+        &self, cmd: InputCmd
+    ) -> Result<(), Error> {
+        if !self.conn.is_connected.load(Ordering::Relaxed) {
+            return Err(format_err!("Not connected"));
+        }
+        let mut cmd_tx = self.conn.pointer_cmd_tx.clone();
+        let res_fut = async {
+            cmd_tx.send(cmd).await;
+        };
+        let res = if let Some(read_timeout) = self.conn.read_timeout {
+            timeout(read_timeout, res_fut).await?
+        } else {
+            res_fut.await
+        };
+        Ok(res)
     }
 }
 
@@ -201,6 +216,7 @@ mod tests {
         println!("{:?}", inputs);
         let mouse_socket = tv.get_pointer_input_socket().await.unwrap();
         println!("{:?}", mouse_socket);
+        tv.send_button("BACK").await.unwrap();
     }
 
 //    #[async_std::test]

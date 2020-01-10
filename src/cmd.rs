@@ -5,6 +5,8 @@ use futures::channel::oneshot;
 
 use serde_json::{self, json};
 
+use url::Url;
+
 const AUDIO_URI: &str = "ssap://audio";
 const SYSTEM_URI: &str = "ssap://system";
 const TV_URI: &str = "ssap://tv";
@@ -15,8 +17,7 @@ fn mk_uri(base: &str, cmd: &str) -> String {
 }
 
 #[derive(Debug)]
-pub enum TvCmd {
-    // WaitConn(oneshot::Sender<Result<(), Error>>),
+pub(crate) enum TvCmd {
     TurnOff(oneshot::Sender<Result<(), Error>>),
     OpenChannel(u8, oneshot::Sender<Result<(), Error>>),
     GetVolume(oneshot::Sender<Result<u8, Error>>),
@@ -25,8 +26,7 @@ pub enum TvCmd {
     VolumeDown(oneshot::Sender<Result<(), Error>>),
     GetInputs(oneshot::Sender<Result<Vec<String>, Error>>),
     SwitchInput(String, oneshot::Sender<Result<(), Error>>),
-
-    GetPointerInputSocket(oneshot::Sender<Result<serde_json::Value, Error>>),
+    GetPointerInputSocket(oneshot::Sender<Result<Url, Error>>),
 }
 
 type CmdChannelResult<T> = Result<Result<T, Error>, oneshot::Canceled>;
@@ -72,7 +72,7 @@ impl TvCmd {
         (res_rx, TvCmd::SwitchInput(input.to_string(), res_tx))
     }
 
-    pub fn get_pointer_input_socket() -> (impl Future<Output = CmdChannelResult<serde_json::Value>>, TvCmd) {
+    pub fn get_pointer_input_socket() -> (impl Future<Output = CmdChannelResult<Url>>, TvCmd) {
         let (res_tx, res_rx) = oneshot::channel();
         (res_rx, TvCmd::GetPointerInputSocket(res_tx))
     }
@@ -158,7 +158,41 @@ impl TvCmd {
                 ch.send(level).ok();
             }
             GetPointerInputSocket(ch) => {
-                ch.send(resp).ok();
+                let pointer_url = resp
+                    .and_then(|r| {
+                        r["payload"]["socketPath"].as_str()
+                            .map(|s| s.to_string())
+                            .ok_or(format_err!("Invalid response"))
+                    })
+                    .and_then(|s| Url::parse(&s).map_err(|e| format_err!("Cannot parse url")));
+                ch.send(pointer_url).ok();
+            }
+        }
+    }
+}
+
+pub(crate) enum InputCmd {
+    Button(String),
+    MouseMove { dx: f64, dy: f64, drag: bool },
+    Scroll { dx: f64, dy: f64 },
+}
+
+impl InputCmd {
+    pub fn prepare(&self) -> String {
+        use InputCmd::*;
+
+        match self {
+            Button(key_name) => {
+                format!("type:button\nname:{}\n\n", key_name)
+            }
+            MouseMove {dx, dy, drag} => {
+                format!(
+                    "type:move\ndx:{}\ndy:{}\ndown:{}\n\n",
+                    dx, dy, if *drag { 1 } else { 0 }
+                )
+            }
+            Scroll {dx, dy} => {
+                format!("type:scroll\ndx:{}\ndy:{}\n\n", dx, dy)
             }
         }
     }

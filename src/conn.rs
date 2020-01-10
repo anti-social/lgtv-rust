@@ -29,15 +29,18 @@ use std::convert::TryInto;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::cmd::TvCmd;
+use crate::cmd::{InputCmd, TvCmd};
 
 const PAIRING: &'static str = include_str!("pairing.json");
 
 pub(crate) struct PersistentConn {
-    url: Url,
-    client_key: String,
-    connect_timeout: Option<Duration>,
-    read_timeout: Option<Duration>,
+    pub url: Url,
+    pub connect_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
+    pub wait_conn_tx: mpsc::Sender<oneshot::Sender<()>>,
+    pub cmd_tx: mpsc::Sender<TvCmd>,
+    pub pointer_cmd_tx: mpsc::Sender<InputCmd>,
+    pub is_connected: Arc<AtomicBool>,
 }
 
 impl PersistentConn {
@@ -46,20 +49,16 @@ impl PersistentConn {
         client_key: String,
         connect_timeout: Option<Duration>,
         read_timeout: Option<Duration>,
-        mut wait_conn_rx: Receiver<oneshot::Sender<()>>,
-        cmd_rx: Receiver<TvCmd>,
-    ) -> Arc<AtomicBool> {
-        let mut cmd_rx = cmd_rx.fuse();
+    ) -> PersistentConn {
+        let (mut cmd_tx, mut cmd_rx) = mpsc::channel::<TvCmd>(1);
+        let mut cmd_tx2 = cmd_tx.clone();
+        let (pointer_cmd_tx, mut pointer_cmd_rx) = mpsc::channel::<InputCmd>(1);
 
-        let conn = PersistentConn {
-            url,
-            client_key,
-            connect_timeout,
-            read_timeout,
-        };
+        let (wait_conn_tx, mut wait_conn_rx) = mpsc::channel::<oneshot::Sender<()>>(1);
 
         let is_connected = Arc::new(AtomicBool::new(false));
-        let is_connected_check = is_connected.clone();
+        let is_connected_tx = is_connected.clone();
+        let is_connected_rx = is_connected.clone();
         let ret = is_connected.clone();
 
         let conn_waiters_tx = Arc::new(Mutex::new(
@@ -67,21 +66,24 @@ impl PersistentConn {
         ));
         let conn_waiters_rx = conn_waiters_tx.clone();
 
+        let ws_url = url.clone();
         task::spawn(async move {
             trace!("Starting persistent connection loop ...");
             loop {
-                trace!("Connecting to {} ...", &conn.url);
-                let ws_stream = match conn.connect().await {
-                    Ok(ws_stream) => {
-                        info!("Connected to {}", &conn.url);
-
-                        // Notify all who waits for connection
-                        let mut conn_waiters = conn_waiters_rx.lock().await;
-                        is_connected.store(true, Ordering::Relaxed);
-                        for conn_waiter in (*conn_waiters).drain(..) {
-                            conn_waiter.send(()).ok();
+                trace!("Connecting to {} ...", &ws_url);
+                let conn_fut = async {
+                    let conn_res = PersistentConn::connect(ws_url.clone(), connect_timeout).await;
+                    match conn_res {
+                        Ok(mut ws_stream) => {
+                            PersistentConn::pair(&mut ws_stream, client_key.clone(), read_timeout).await
+                                .map(|_| ws_stream)
                         }
-
+                        Err(e) => Err(e)
+                    }
+                };
+                let ws_stream = match conn_fut.await {
+                    Ok(ws_stream) => {
+                        info!("Connected to {}", &ws_url);
                         ws_stream
                     },
                     Err(e) => {
@@ -92,14 +94,35 @@ impl PersistentConn {
                 };
                 let (ws_tx, _ws_rx) = ws_stream.split();
                 let ws_rx = _ws_rx.fuse();
-                cmd_rx = match Conn::start(ws_tx, ws_rx, cmd_rx).await {
+                let cmd_fut = Conn::start(ws_tx, ws_rx, cmd_rx);
+
+                let (input_cmd_rx, input_cmd) = TvCmd::get_pointer_input_socket();
+                cmd_tx2.send(input_cmd).await;
+                let input_url = input_cmd_rx.await.unwrap().unwrap();
+                println!("Input ws url: {:?}", input_url);
+
+                let pointer_ws_stream = PersistentConn::connect(input_url, connect_timeout).await.unwrap();
+                let (pointer_ws_tx, _pointer_ws_rx) = pointer_ws_stream.split();
+                let pointer_ws_rx = _pointer_ws_rx.fuse();
+                let input_cmd_fut = InputConn::start(pointer_ws_tx, pointer_ws_rx, pointer_cmd_rx);
+
+                // Notify all who waits for connection
+                let mut conn_waiters = conn_waiters_rx.lock().await;
+                is_connected_tx.store(true, Ordering::Relaxed);
+                for conn_waiter in (*conn_waiters).drain(..) {
+                    conn_waiter.send(()).ok();
+                }
+
+                cmd_rx = match cmd_fut.await {
                     ConnExitStatus::Reconnect(cmd_rx) => {
                         info!("Disconnected. Trying to reconnect ...");
-                        is_connected.store(false, Ordering::Relaxed);
+                        is_connected_tx.store(false, Ordering::Relaxed);
                         cmd_rx
                     },
                     ConnExitStatus::Finish => break,
-                }
+                };
+
+                pointer_cmd_rx = input_cmd_fut.await;
             }
         });
 
@@ -108,7 +131,7 @@ impl PersistentConn {
                 match wait_conn_rx.next().await {
                     Some(ch) => {
                         let mut conn_waiters = conn_waiters_tx.lock().await;
-                        if is_connected_check.load(Ordering::Relaxed) {
+                        if is_connected_rx.load(Ordering::Relaxed) {
                             ch.send(()).ok();
                         } else {
                             (*conn_waiters).push(ch);
@@ -119,33 +142,41 @@ impl PersistentConn {
             }
         });
 
-        ret
+        PersistentConn {
+            url,
+            connect_timeout,
+            read_timeout,
+            wait_conn_tx,
+            cmd_tx,
+            pointer_cmd_tx,
+            is_connected,
+        }
     }
 
     async fn connect(
-        &self,
+        url: Url, connect_timeout: Option<Duration>,
     ) -> Result<WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>, Error> {
-        let (mut ws_stream, _) = if let Some(conn_timeout) = self.connect_timeout {
-            timeout(conn_timeout, connect_async(self.url.clone())).await??
+        let (mut ws_stream, _) = if let Some(conn_timeout) = connect_timeout {
+            timeout(conn_timeout, connect_async(url)).await??
         } else {
-            connect_async(self.url.clone()).await?
+            connect_async(url).await?
         };
-        self.pair(&mut ws_stream).await?;
         Ok(ws_stream)
     }
 
     async fn pair(
-        &self,
         ws_stream: &mut WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>,
+        client_key: String,
+        read_timeout: Option<Duration>,
     ) -> Result<(), Error> {
         let mut pairing_json: serde_json::Value = serde_json::from_str(PAIRING)?;
         pairing_json["payload"].as_object_mut()
             .ok_or(format_err!("Corrupted pairing.json file"))?
-            .insert("client-key".to_string(), serde_json::Value::String(self.client_key.clone()));
+            .insert("client-key".to_string(), serde_json::Value::String(client_key.clone()));
         let pairing_msg = Message::text(pairing_json.to_string());
 
         ws_stream.send(pairing_msg).await?;
-        let pairing_resp = if let Some(read_timeout) = self.read_timeout {
+        let pairing_resp = if let Some(read_timeout) = read_timeout {
             timeout(read_timeout, ws_stream.next()).await?
         } else {
             ws_stream.next().await
@@ -333,5 +364,52 @@ impl<S> Conn<S>
                         cmd.process(Ok(resp));
                     })
             });
+    }
+}
+
+struct InputConn {
+
+}
+
+impl InputConn {
+    fn start<S, R, CMD>(mut ws_tx: S, mut ws_rx: R, mut cmd_rx: CMD) -> impl Future<Output = CMD>
+        where S: Sink<Message> + Send + Unpin + 'static,
+              R: Stream<Item = WsResult<Message>> + FusedStream + Send + Unpin + 'static,
+              CMD: Stream<Item = InputCmd> + FusedStream + Send + Unpin + 'static,
+    {
+        let task_handle = task::spawn(async move {
+            loop {
+                select!(
+                    cmd = cmd_rx.next() => {
+                        match(cmd) {
+                            Some(cmd) => {
+                                ws_tx.send(Message::Text(cmd.prepare())).await.ok();
+                            }
+                            None => {
+                                break;
+                            }
+                        }
+                    }
+                    msg = ws_rx.next() => {
+                        trace!("Input connection received a message: {:?}", msg);
+                        match msg {
+                            Some(Ok(Message::Text(data))) => {
+                            }
+                            Some(Ok(Message::Ping(data))) => {
+                                ws_tx.send(Message::Pong(data)).await.ok();
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(_)) => {}
+                            None => {
+                                break;
+                            }
+                        }
+                    }
+                );
+            }
+            cmd_rx
+        });
+
+        task_handle
     }
 }
