@@ -3,10 +3,10 @@
 use failure::{Error, format_err};
 
 use futures::Future;
-use futures::channel::oneshot;
+use futures::sink::SinkExt;
+use futures::channel::{mpsc, oneshot};
 
 use async_std::future::timeout;
-use async_std::sync::{channel, Sender};
 
 use std::time::Duration;
 
@@ -44,9 +44,9 @@ impl LgtvBuilder {
 
     pub async fn connect(self, url: &str, client_key: &str) -> Result<Lgtv, Error> {
         let url = Url::parse(url)?;
-        let (cmd_tx, cmd_rx) = channel::<TvCmd>(1);
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
 
-        let (wait_conn_tx, wait_conn_rx) = channel(1);
+        let (wait_conn_tx, wait_conn_rx) = mpsc::channel(1);
 
         let is_connected = PersistentConn::start(
             url.clone(),
@@ -70,8 +70,8 @@ impl LgtvBuilder {
 pub struct Lgtv {
     _url: Url,
     read_timeout: Option<Duration>,
-    wait_conn_tx: Sender<oneshot::Sender<()>>,
-    cmd_tx: Sender<TvCmd>,
+    wait_conn_tx: mpsc::Sender<oneshot::Sender<()>>,
+    cmd_tx: mpsc::Sender<TvCmd>,
     is_connected: Arc<AtomicBool>,
 }
 
@@ -84,7 +84,7 @@ impl Lgtv {
 
     pub async fn wait_conn(&self) {
         let (conn_tx, conn_rx) = oneshot::channel();
-        self.wait_conn_tx.send(conn_tx).await;
+        self.wait_conn_tx.clone().send(conn_tx).await.ok();
         conn_rx.await.ok();
     }
 
@@ -131,9 +131,10 @@ impl Lgtv {
         if !self.is_connected.load(Ordering::Relaxed) {
             return Err(format_err!("Not connected"));
         }
+        let mut cmd_tx = self.cmd_tx.clone();
         let (cmd_res_rx, cmd) = rx_fut_and_cmd;
         let res_fut = async {
-            self.cmd_tx.send(cmd).await;
+            cmd_tx.send(cmd).await.ok();
             cmd_res_rx.await
         };
         let res = if let Some(read_timeout) = self.read_timeout {

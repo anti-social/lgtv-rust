@@ -8,7 +8,6 @@ use futures::lock::Mutex;
 use futures::stream::FusedStream;
 
 use async_std::future::{timeout, TimeoutError};
-use async_std::sync::Receiver;
 use async_std::task;
 
 use async_tungstenite::{connect_async, WebSocketStream};
@@ -47,8 +46,8 @@ impl PersistentConn {
         client_key: String,
         connect_timeout: Option<Duration>,
         read_timeout: Option<Duration>,
-        mut wait_conn_rx: Receiver<oneshot::Sender<()>>,
-        cmd_rx: Receiver<TvCmd>,
+        mut wait_conn_rx: mpsc::Receiver<oneshot::Sender<()>>,
+        cmd_rx: mpsc::Receiver<TvCmd>,
     ) -> Arc<AtomicBool> {
         let mut cmd_rx = cmd_rx.fuse();
 
