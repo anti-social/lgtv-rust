@@ -151,7 +151,8 @@ mod tests {
     use std::time::Duration;
     use crate::Lgtv;
 
-    const URL: &str = "ws://192.168.2.3:3000";
+//    const URL: &str = "ws://192.168.2.3:3000";
+    const URL: &str = "ws://localhost:3000";
     const CLIENT_KEY: &str = "0b85eb0d4f4a9a5b29e2f32c2f469eb5";
 
     async fn connect(url: &str) -> Lgtv {

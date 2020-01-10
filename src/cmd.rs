@@ -16,7 +16,6 @@ fn mk_uri(base: &str, cmd: &str) -> String {
 
 #[derive(Debug)]
 pub enum TvCmd {
-    // WaitConn(oneshot::Sender<Result<(), Error>>),
     TurnOff(oneshot::Sender<Result<(), Error>>),
     OpenChannel(u8, oneshot::Sender<Result<(), Error>>),
     GetVolume(oneshot::Sender<Result<u8, Error>>),
