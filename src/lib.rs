@@ -9,7 +9,8 @@ use url::Url;
 // use wakey::WolPacket;
 
 mod cmd;
-pub use cmd::TvCmd;
+use cmd::{PointerCmd, TvCmd};
+pub use cmd::ButtonKey;
 mod conn;
 use conn::PersistentConn;
 mod scan;
@@ -93,8 +94,8 @@ impl Lgtv {
         self.conn.send_cmd(TvCmd::volume_down()).await
     }
 
-    pub async fn get_pointer_input_socket(&self) -> Result<serde_json::Value, Error> {
-        self.conn.send_cmd(TvCmd::get_pointer_input_socket()).await
+    pub async fn button(&self, key: ButtonKey) -> Result<(), Error> {
+        self.conn.send_pointer_cmd(PointerCmd::Button(key)).await
     }
 }
 
@@ -102,7 +103,7 @@ impl Lgtv {
 mod tests {
     use async_std::future::timeout;
     use std::time::Duration;
-    use crate::Lgtv;
+    use crate::{Lgtv, ButtonKey};
 
     const URL: &str = "ws://192.168.2.3:3000";
     // const URL: &str = "ws://localhost:3000";
@@ -153,8 +154,7 @@ mod tests {
         println!("Sending command ...");
         let inputs = tv.get_inputs().await.expect("Error when sending a command");
         println!("{:?}", inputs);
-        let mouse_socket = tv.get_pointer_input_socket().await.unwrap();
-        println!("{:?}", mouse_socket);
+        tv.button(ButtonKey::Back).await.unwrap();
     }
 
 //    #[async_std::test]

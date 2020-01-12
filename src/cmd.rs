@@ -5,6 +5,10 @@ use futures::channel::oneshot;
 
 use serde_json::{self, json};
 
+use std::fmt;
+
+use url::Url;
+
 const AUDIO_URI: &str = "ssap://audio";
 const SYSTEM_URI: &str = "ssap://system";
 const TV_URI: &str = "ssap://tv";
@@ -26,7 +30,7 @@ pub enum TvCmd {
     GetInputs(oneshot::Sender<Result<Vec<String>, Error>>),
     SwitchInput(String, oneshot::Sender<Result<(), Error>>),
 
-    GetPointerInputSocket(oneshot::Sender<Result<serde_json::Value, Error>>),
+    GetPointerInputSocket(oneshot::Sender<Result<Url, Error>>),
 }
 
 type CmdChannelResult<T> = Result<Result<T, Error>, oneshot::Canceled>;
@@ -77,7 +81,7 @@ impl TvCmd {
         (res_rx, TvCmd::SwitchInput(input.to_string(), res_tx))
     }
 
-    pub fn get_pointer_input_socket() -> (impl Future<Output = CmdChannelResult<serde_json::Value>>, TvCmd) {
+    pub fn get_pointer_input_socket() -> (impl Future<Output = CmdChannelResult<Url>>, TvCmd) {
         let (res_tx, res_rx) = oneshot::channel();
         (res_rx, TvCmd::GetPointerInputSocket(res_tx))
     }
@@ -174,7 +178,57 @@ impl TvCmd {
                 ch.send(level).ok();
             }
             GetPointerInputSocket(ch) => {
-                ch.send(resp).ok();
+                let pointer_url = resp
+                    .and_then(|r| {
+                        r["payload"]["socketPath"].as_str()
+                            .map(|s| s.to_string())
+                            .ok_or(format_err!("Invalid response"))
+                    })
+                    .and_then(|s| Url::parse(&s).map_err(|e| format_err!("Cannot parse url: {}", e)));
+                ch.send(pointer_url).ok();
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum PointerCmd {
+    Button(ButtonKey),
+    MouseMove { dx: f64, dy: f64, drag: bool },
+    Scroll { dx: f64, dy: f64 },
+}
+
+#[derive(Debug)]
+pub enum ButtonKey {
+    Back,
+}
+
+impl fmt::Display for ButtonKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use ButtonKey::*;
+
+        match self {
+            Back => write!(f, "BACK"),
+        }
+    }
+}
+
+impl PointerCmd {
+    pub fn prepare(&self) -> String {
+        use PointerCmd::*;
+
+        match self {
+            Button(key) => {
+                format!("type:button\nname:{}\n\n", key)
+            }
+            MouseMove {dx, dy, drag} => {
+                format!(
+                    "type:move\ndx:{}\ndy:{}\ndown:{}\n\n",
+                    dx, dy, if *drag { 1 } else { 0 }
+                )
+            }
+            Scroll {dx, dy} => {
+                format!("type:scroll\ndx:{}\ndy:{}\n\n", dx, dy)
             }
         }
     }

@@ -29,7 +29,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::cmd::TvCmd;
+use crate::cmd::{PointerCmd, TvCmd};
 
 #[derive(Clone)]
 pub(crate) struct PersistentConn {
@@ -38,6 +38,7 @@ pub(crate) struct PersistentConn {
     read_timeout: Option<Duration>,
     wait_conn_tx: mpsc::Sender<oneshot::Sender<()>>,
     cmd_tx: mpsc::Sender<TvCmd>,
+    pointer_cmd_tx: mpsc::Sender<PointerCmd>,
     is_connected: Arc<AtomicBool>,
 }
 
@@ -49,6 +50,7 @@ impl PersistentConn {
         read_timeout: Option<Duration>,
     ) -> PersistentConn {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let (pointer_cmd_tx, mut pointer_cmd_rx) = mpsc::channel(1);
         // let mut cmd_rx = _cmd_rx.fuse();
         let (wait_conn_tx, mut wait_conn_rx) = mpsc::channel(1);
         let is_connected = Arc::new(AtomicBool::new(false));
@@ -60,6 +62,7 @@ impl PersistentConn {
             read_timeout,
             wait_conn_tx,
             cmd_tx,
+            pointer_cmd_tx,
             is_connected,
         };
         let conn_ret = conn.clone();
@@ -113,12 +116,28 @@ impl PersistentConn {
                     }
                 }
 
+                let pointer_url = conn.get_pointer_input_url().await.unwrap();
+                let pointer_ws_stream = PersistentConn::connect(pointer_url.clone(), connect_timeout).await.unwrap();
+                let (pointer_ws_tx, _pointer_ws_rx) = pointer_ws_stream.split();
+                let pointer_ws_rx = _pointer_ws_rx.fuse();
+                let (pointer_close_tx, _pointer_close_rx) = mpsc::channel(1);
+                let pointer_close_rx = _pointer_close_rx.fuse();
+                let pointer_conn_processor = PointerConnProcessor::new();
+                let pointer_conn_fut = Conn::start(
+                    pointer_conn_processor, pointer_ws_tx, pointer_ws_rx, pointer_cmd_rx, pointer_close_tx.clone(), pointer_close_rx
+                );
+
                 cmd_rx = match main_conn_fut.await {
                     ConnExitStatus::Reconnect(cmd_rx) => {
                         info!("Disconnected. Trying to reconnect ...");
                         is_connected_tx.store(false, Ordering::Relaxed);
                         cmd_rx
                     },
+                    ConnExitStatus::Finish => break,
+                };
+
+                pointer_cmd_rx = match pointer_conn_fut.await {
+                    ConnExitStatus::Reconnect(cmd_rx) => cmd_rx,
                     ConnExitStatus::Finish => break,
                 };
             }
@@ -182,6 +201,17 @@ impl PersistentConn {
         res.map_err(|e| format_err!("Canceled channel: {}", e))?
     }
 
+    pub async fn send_pointer_cmd(
+        &self, cmd: PointerCmd
+    ) -> Result<(), Error> {
+        if !self.is_connected() {
+            return Err(format_err!("Not connected"));
+        }
+        let mut                                                            cmd_tx = self.pointer_cmd_tx.clone();
+        cmd_tx.send(cmd).await.ok();
+        Ok(())
+    }
+
     async fn connect(
         url: Url, connect_timeout: Option<Duration>
     ) -> Result<WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>, Error> {
@@ -195,6 +225,10 @@ impl PersistentConn {
 
     async fn pair(&self) -> Result<(), Error> {
         self.send_cmd_inner(TvCmd::register(self.client_key.clone())).await
+    }
+
+    async fn get_pointer_input_url(&self) -> Result<Url, Error> {
+        self.send_cmd_inner(TvCmd::get_pointer_input_socket()).await
     }
 }
 
@@ -463,3 +497,23 @@ impl MsgProcessor for MainConnProcessor {
         ProcessorResp::Continue
     }
 }
+
+#[derive(Debug)]
+struct PointerConnProcessor;
+
+impl PointerConnProcessor {
+    fn new() -> PointerConnProcessor {
+        PointerConnProcessor {}
+    }
+}
+
+impl CmdProcessor<PointerCmd> for PointerConnProcessor {
+    fn on_cmd(&mut self, cmd: PointerCmd) -> ProcessorResp {
+        let prepared_cmd = cmd.prepare();
+        ProcessorResp::ContinueWith(Message::text(prepared_cmd))
+    }
+}
+
+impl MsgProcessor for PointerConnProcessor {}
+
+impl PingProcessor for PointerConnProcessor {}
