@@ -16,6 +16,7 @@ fn mk_uri(base: &str, cmd: &str) -> String {
 
 #[derive(Debug)]
 pub enum TvCmd {
+    Register(String, oneshot::Sender<Result<(), Error>>),
     TurnOff(oneshot::Sender<Result<(), Error>>),
     OpenChannel(u8, oneshot::Sender<Result<(), Error>>),
     GetVolume(oneshot::Sender<Result<u8, Error>>),
@@ -31,6 +32,11 @@ pub enum TvCmd {
 type CmdChannelResult<T> = Result<Result<T, Error>, oneshot::Canceled>;
 
 impl TvCmd {
+    pub fn register(client_key: String) -> (impl Future<Output = CmdChannelResult<()>>, TvCmd) {
+        let (res_tx, res_rx) = oneshot::channel();
+        (res_rx, TvCmd::Register(client_key, res_tx))
+    }
+
     pub fn turn_off() -> (impl Future<Output = CmdChannelResult<()>>, TvCmd) {
         let (res_tx, res_rx) = oneshot::channel();
         (res_rx, TvCmd::TurnOff(res_tx))
@@ -80,45 +86,55 @@ impl TvCmd {
         use TvCmd::*;
         use serde_json::*;
 
-        let mut msg = json!({
-            "type": "request",
-        });
-
-        let (uri, cmd_name, payload) = match self {
+        let (req_type, uri, cmd_name, payload) = match self {
+            Register(client_key, _) => {
+                let mut payload: Value = from_str(include_str!("pairing.json"))
+                    .expect("Invalid pairing payload");
+                payload.as_object_mut()
+                    .expect("Invalid pairing payload")
+                    .insert("client-key".to_string(), Value::String(client_key.clone()));
+                ("register", None, "register", Some(payload))
+            }
             TurnOff(_) => {
-                (SYSTEM_URI, "turnOff", None)
+                ("request", Some(SYSTEM_URI), "turnOff", None)
             }
             OpenChannel(channel, _) => {
-                (TV_URI, "openChannel", Some(json!({"channelNumber": channel})))
+                ("request", Some(TV_URI), "openChannel", Some(json!({"channelNumber": channel})))
             }
             GetInputs(_) => {
-                (TV_URI, "getExternalInputList", None)
+                ("request", Some(TV_URI), "getExternalInputList", None)
             }
             SwitchInput(input, _) => {
-                (TV_URI, "switchInput", Some(json!({"inputId": input})))
+                ("request", Some(TV_URI), "switchInput", Some(json!({"inputId": input})))
             }
             GetVolume(_) => {
-                (AUDIO_URI, "getVolume", None)
+                ("request", Some(AUDIO_URI), "getVolume", None)
             }
             SetVolume(level, _) => {
-                (AUDIO_URI, "setVolume", Some(json!({"volume": level})))
+                ("request", Some(AUDIO_URI), "setVolume", Some(json!({"volume": level})))
             }
             VolumeUp(_) => {
-                (AUDIO_URI, "volumeUp", None)
+                ("request", Some(AUDIO_URI), "volumeUp", None)
             }
             VolumeDown(_) => {
-                (AUDIO_URI, "volumeDown", None)
+                ("request", Some(AUDIO_URI), "volumeDown", None)
             }
             GetPointerInputSocket(_) => {
-                (NETWORK_INPUT_URI, "getPointerInputSocket", None)
+                ("request", Some(NETWORK_INPUT_URI), "getPointerInputSocket", None)
             }
         };
 
-        msg["id"] = Value::String(format!("{}-{}", cmd_name, counter));
-        msg["uri"] = Value::String(mk_uri(uri, cmd_name));
+        let mut msg = json!({
+            "id": Value::String(format!("{}_{}", cmd_name, counter)),
+            "type": req_type,
+        });
+        if let Some(uri) = uri {
+            msg["uri"] = Value::String(mk_uri(uri, cmd_name));
+        }
         if let Some(payload) = payload {
             msg["payload"] = payload;
         }
+        println!("Sending message: {:?}", &msg);
         msg
     }
 
@@ -126,6 +142,7 @@ impl TvCmd {
         use TvCmd::*;
 
         match self {
+            Register(_, ch) |
             TurnOff(ch) |
             OpenChannel(_, ch) |
             SwitchInput(_, ch) |

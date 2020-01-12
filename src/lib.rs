@@ -1,19 +1,10 @@
 #![recursion_limit="1024"]
 
-use failure::{Error, format_err};
-
-use futures::Future;
-use futures::sink::SinkExt;
-use futures::channel::{mpsc, oneshot};
-
-use async_std::future::timeout;
+use failure::Error;
 
 use std::time::Duration;
 
 use url::Url;
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // use wakey::WolPacket;
 
@@ -44,35 +35,19 @@ impl LgtvBuilder {
 
     pub async fn connect(self, url: &str, client_key: &str) -> Result<Lgtv, Error> {
         let url = Url::parse(url)?;
-        let (cmd_tx, cmd_rx) = mpsc::channel(1);
-
-        let (wait_conn_tx, wait_conn_rx) = mpsc::channel(1);
-
-        let is_connected = PersistentConn::start(
+        let conn = PersistentConn::start(
             url.clone(),
             client_key.to_string(),
             self.connect_timeout,
             self.read_timeout,
-            wait_conn_rx,
-            cmd_rx
         ).await;
 
-        Ok(Lgtv {
-            _url: url,
-            read_timeout: self.read_timeout,
-            wait_conn_tx,
-            cmd_tx,
-            is_connected,
-        })
+        Ok(Lgtv { conn })
     }
 }
 
 pub struct Lgtv {
-    _url: Url,
-    read_timeout: Option<Duration>,
-    wait_conn_tx: mpsc::Sender<oneshot::Sender<()>>,
-    cmd_tx: mpsc::Sender<TvCmd>,
-    is_connected: Arc<AtomicBool>,
+    conn: PersistentConn,
 }
 
 impl Lgtv {
@@ -83,66 +58,43 @@ impl Lgtv {
 //    pub fn close(self) {}
 
     pub async fn wait_conn(&self) {
-        let (conn_tx, conn_rx) = oneshot::channel();
-        self.wait_conn_tx.clone().send(conn_tx).await.ok();
-        conn_rx.await.ok();
+        self.conn.wait().await
     }
 
     pub async fn turn_off(&self) -> Result<(), Error> {
-        self.send_cmd(TvCmd::turn_off()).await
+        self.conn.send_cmd(TvCmd::turn_off()).await
     }
 
     pub async fn open_channel(&self, num: u8) -> Result<(), Error> {
-        self.send_cmd(TvCmd::open_channel(num)).await
+        self.conn.send_cmd(TvCmd::open_channel(num)).await
     }
 
     pub async fn get_inputs(&self) -> Result<Vec<String>, Error> {
-        self.send_cmd(TvCmd::get_inputs()).await
+        self.conn.send_cmd(TvCmd::get_inputs()).await
     }
 
     pub async fn switch_input(&self, input: &str) -> Result<(), Error> {
-        self.send_cmd(TvCmd::switch_input(input)).await
+        self.conn.send_cmd(TvCmd::switch_input(input)).await
     }
 
     pub async fn get_volume(&self) -> Result<u8, Error> {
-        self.send_cmd(TvCmd::get_volume()).await
+        self.conn.send_cmd(TvCmd::get_volume()).await
     }
 
     pub async fn set_volume(&self, level: u8) -> Result<(), Error> {
-        self.send_cmd(TvCmd::set_volume(level)).await
+        self.conn.send_cmd(TvCmd::set_volume(level)).await
     }
 
     pub async fn volume_up(&self) -> Result<(), Error> {
-        self.send_cmd(TvCmd::volume_up()).await
+        self.conn.send_cmd(TvCmd::volume_up()).await
     }
 
     pub async fn volume_down(&self) -> Result<(), Error> {
-        self.send_cmd(TvCmd::volume_down()).await
+        self.conn.send_cmd(TvCmd::volume_down()).await
     }
 
     pub async fn get_pointer_input_socket(&self) -> Result<serde_json::Value, Error> {
-        self.send_cmd(TvCmd::get_pointer_input_socket()).await
-    }
-
-    async fn send_cmd<T>(
-        &self,
-        rx_fut_and_cmd: (impl Future<Output = Result<Result<T, Error>, oneshot::Canceled>>, TvCmd)
-    ) -> Result<T, Error> {
-        if !self.is_connected.load(Ordering::Relaxed) {
-            return Err(format_err!("Not connected"));
-        }
-        let mut cmd_tx = self.cmd_tx.clone();
-        let (cmd_res_rx, cmd) = rx_fut_and_cmd;
-        let res_fut = async {
-            cmd_tx.send(cmd).await.ok();
-            cmd_res_rx.await
-        };
-        let res = if let Some(read_timeout) = self.read_timeout {
-            timeout(read_timeout, res_fut).await?
-        } else {
-            res_fut.await
-        };
-        res.map_err(|e| format_err!("Canceled channel: {}", e))?
+        self.conn.send_cmd(TvCmd::get_pointer_input_socket()).await
     }
 }
 
@@ -152,8 +104,8 @@ mod tests {
     use std::time::Duration;
     use crate::Lgtv;
 
-//    const URL: &str = "ws://192.168.2.3:3000";
-    const URL: &str = "ws://localhost:3000";
+    const URL: &str = "ws://192.168.2.3:3000";
+    // const URL: &str = "ws://localhost:3000";
     const CLIENT_KEY: &str = "0b85eb0d4f4a9a5b29e2f32c2f469eb5";
 
     async fn connect(url: &str) -> Lgtv {
