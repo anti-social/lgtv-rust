@@ -51,7 +51,6 @@ impl PersistentConn {
     ) -> PersistentConn {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
         let (pointer_cmd_tx, mut pointer_cmd_rx) = mpsc::channel(1);
-        // let mut cmd_rx = _cmd_rx.fuse();
         let (wait_conn_tx, mut wait_conn_rx) = mpsc::channel(1);
         let is_connected = Arc::new(AtomicBool::new(false));
         let (is_connected_tx, is_connected_rx) = (is_connected.clone(), is_connected.clone());
@@ -92,42 +91,54 @@ impl PersistentConn {
                 let main_conn_processor = MainConnProcessor::new();
                 let (ws_tx, _ws_rx) = ws_stream.split();
                 let ws_rx = _ws_rx.fuse();
-                let (mut close_tx, _close_rx) = mpsc::channel(1);
-                let close_rx = _close_rx.fuse();
 
                 // We should start a connection before pairing with TV
-                let main_conn_fut = Conn::start(
-                    main_conn_processor, ws_tx, ws_rx, cmd_rx, close_tx.clone(), close_rx
+                let main_conn = start_conn(
+                    main_conn_processor, ws_tx, ws_rx, cmd_rx
                 );
 
                 match conn.pair().await {
-                    Ok(_) => {
-                        // Notify all who waits for connection
-                        let mut conn_waiters = conn_waiters_rx.lock().await;
-                        is_connected_tx.store(true, Ordering::Relaxed);
-                        for conn_waiter in (*conn_waiters).drain(..) {
-                            conn_waiter.send(()).ok();
-                        }
-                    }
+                    Ok(_) => {}
                     Err(e) => {
                         warn!("Error when pairing: {}", e);
                         task::sleep(Duration::from_secs(10)).await;
-                        close_tx.send(()).await.ok();
+                        main_conn.close().await.ok();
                     }
                 }
 
-                let pointer_url = conn.get_pointer_input_url().await.unwrap();
-                let pointer_ws_stream = PersistentConn::connect(pointer_url.clone(), connect_timeout).await.unwrap();
+                let pointer_url = match conn.get_pointer_input_url().await {
+                    Ok(url) => url,
+                    Err(e) => {
+                        warn!("Error when receiving pointer websocket url: {}", e);
+                        task::sleep(Duration::from_secs(10)).await;
+                        main_conn.close().await.ok();
+                        continue;
+                    }
+                };
+                let pointer_ws_stream = match PersistentConn::connect(pointer_url.clone(), connect_timeout).await {
+                    Ok(ws_stream) => ws_stream,
+                    Err(e) => {
+                        warn!("Cannot connect to pointer: {}", e);
+                        task::sleep(Duration::from_secs(10)).await;
+                        main_conn.close().await.ok();
+                        continue;
+                    }
+                };
                 let (pointer_ws_tx, _pointer_ws_rx) = pointer_ws_stream.split();
                 let pointer_ws_rx = _pointer_ws_rx.fuse();
-                let (pointer_close_tx, _pointer_close_rx) = mpsc::channel(1);
-                let pointer_close_rx = _pointer_close_rx.fuse();
                 let pointer_conn_processor = PointerConnProcessor::new();
-                let pointer_conn_fut = Conn::start(
-                    pointer_conn_processor, pointer_ws_tx, pointer_ws_rx, pointer_cmd_rx, pointer_close_tx.clone(), pointer_close_rx
+                let pointer_conn = start_conn(
+                    pointer_conn_processor, pointer_ws_tx, pointer_ws_rx, pointer_cmd_rx
                 );
 
-                cmd_rx = match main_conn_fut.await {
+                // Notify all who waits for connection
+                let mut conn_waiters = conn_waiters_rx.lock().await;
+                is_connected_tx.store(true, Ordering::Relaxed);
+                for conn_waiter in (*conn_waiters).drain(..) {
+                    conn_waiter.send(()).ok();
+                }
+
+                cmd_rx = match main_conn.task_fut.await {
                     ConnExitStatus::Reconnect(cmd_rx) => {
                         info!("Disconnected. Trying to reconnect ...");
                         is_connected_tx.store(false, Ordering::Relaxed);
@@ -136,7 +147,7 @@ impl PersistentConn {
                     ConnExitStatus::Finish => break,
                 };
 
-                pointer_cmd_rx = match pointer_conn_fut.await {
+                pointer_cmd_rx = match pointer_conn.task_fut.await {
                     ConnExitStatus::Reconnect(cmd_rx) => cmd_rx,
                     ConnExitStatus::Finish => break,
                 };
@@ -207,7 +218,7 @@ impl PersistentConn {
         if !self.is_connected() {
             return Err(format_err!("Not connected"));
         }
-        let mut                                                            cmd_tx = self.pointer_cmd_tx.clone();
+        let mut cmd_tx = self.pointer_cmd_tx.clone();
         cmd_tx.send(cmd).await.ok();
         Ok(())
     }
@@ -237,58 +248,71 @@ enum ConnExitStatus<T> {
     Finish,
 }
 
-struct Conn<WSTX>
-    where WSTX: Sink<Message>
+struct Conn<H, CmdRx, Cmd, CloseTx>
+    where
+        H: Future<Output = ConnExitStatus<CmdRx>>,
+        CmdRx: Stream<Item = Cmd>,
+        Cmd: Debug,
+        CloseTx: Sink<()> + Clone,
 {
-    ws_tx: WSTX,
+    pub close_tx: CloseTx,
+    pub task_fut: H,
 }
 
-impl<WSTX> Conn<WSTX>
-    where WSTX: Sink<Message> + Send + Unpin + 'static,
+impl<H, CmdRx, Cmd, CloseTx> Conn<H, CmdRx, Cmd, CloseTx>
+    where
+        H: Future<Output = ConnExitStatus<CmdRx>>,
+        CmdRx: Stream<Item = Cmd>,
+        Cmd: Debug,
+        CloseTx: Sink<()> + Clone + Send + Unpin + 'static,
 {
-    fn start<P, WSRX, CMDRX, CMD, CLOSETX, CLOSERX>(
-        mut processor: P, ws_tx: WSTX, mut ws_rx: WSRX, mut cmd_rx: CMDRX, mut close_tx: CLOSETX, mut close_rx: CLOSERX,
-    ) -> impl Future<Output = ConnExitStatus<CMDRX>>
-        where
-            P: CmdProcessor<CMD> + PingProcessor + MsgProcessor + Send + Unpin + 'static,
-            WSRX: Stream<Item = WsResult<Message>> + FusedStream + Send + Unpin + 'static,
-            CMDRX: Stream<Item = CMD> + FusedStream + Send + Unpin + 'static,
-            CMD: Debug,
-            CLOSETX: Sink<()> + Send + Unpin + 'static,
-            CLOSERX: Stream<Item = ()> + FusedStream + Send + Unpin + 'static,
-    {
-        let mut conn = Conn {
-            ws_tx,
-        };
+    async fn close(&self) -> Result<(), CloseTx::Error> {
+        self.close_tx.clone().send(()).await
+    }
+}
 
-        let (mut ping_tx, _ping_rx) = mpsc::channel(1);
-        let mut ping_rx = _ping_rx.fuse();
-        let ping_task_handle = task::spawn(async move {
-            for ping_counter in 0u64.. {
-                task::sleep(Duration::from_secs(10)).await;
+fn start_conn<P, WsTx, WsRx, Cmd, CmdRx>(
+    mut processor: P, mut ws_tx: WsTx, mut ws_rx: WsRx, mut cmd_rx: CmdRx
+) -> Conn<impl Future<Output=ConnExitStatus<CmdRx>>, CmdRx, Cmd, impl Sink<()> + Clone>
+    where
+        P: CmdProcessor<Cmd> + PingProcessor + MsgProcessor + Send + Unpin + 'static,
+        WsTx: Sink<Message> + Send + Unpin + 'static,
+        WsRx: Stream<Item = WsResult<Message>> + FusedStream + Send + Unpin + 'static,
+        CmdRx: Stream<Item =Cmd> + FusedStream + Send + Unpin + 'static,
+        Cmd: Debug,
+{
+    let (close_tx, _close_rx) = mpsc::channel(1);
+    let mut ping_close_tx = close_tx.clone();
+    let mut close_rx = _close_rx.fuse();
 
-                let (pong_tx, pong_rx) = oneshot::channel();
-                if ping_tx.send((ping_counter, pong_tx)).await.is_err() {
+    let (mut ping_tx, _ping_rx) = mpsc::channel(1);
+    let mut ping_rx = _ping_rx.fuse();
+    let ping_task_handle = task::spawn(async move {
+        for ping_counter in 0u64.. {
+            task::sleep(Duration::from_secs(10)).await;
+
+            let (pong_tx, pong_rx) = oneshot::channel();
+            if ping_tx.send((ping_counter, pong_tx)).await.is_err() {
+                break;
+            }
+            match timeout(Duration::from_secs(10), pong_rx).await {
+                Ok(Ok(())) => {}
+                Ok(Err(oneshot::Canceled {})) => {
                     break;
                 }
-                match timeout(Duration::from_secs(10), pong_rx).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(oneshot::Canceled {})) => {
-                        break;
-                    }
-                    Err(TimeoutError {..}) => {
-                        trace!("Did not receive pong message. Connection will be closed");
-                        close_tx.send(()).await.ok();
-                        break;
-                    }
+                Err(TimeoutError {..}) => {
+                    trace!("Did not receive pong message. Connection will be closed");
+                    ping_close_tx.send(()).await.ok();
+                    break;
                 }
             }
-        });
+        }
+    });
 
-        let conn_task_handle = task::spawn(async move {
-            trace!("Starting message processing ...");
-            let exit_status = loop {
-                let resp = select! {
+    let conn_task_handle = task::spawn(async move {
+        trace!("Starting message processing ...");
+        let exit_status = loop {
+            let resp = select! {
                     _ = close_rx.next() => {
                         ProcessorResp::Reconnect
                     }
@@ -305,20 +329,22 @@ impl<WSTX> Conn<WSTX>
                         processor.process_msg(msg)
                     }
                 };
-                match resp {
-                    ProcessorResp::Continue => continue,
-                    ProcessorResp::ContinueWith(resp_msg) => {
-                        conn.ws_tx.send(resp_msg).await.ok();
-                        continue;
-                    },
-                    ProcessorResp::Reconnect => break ConnExitStatus::Reconnect(cmd_rx),
-                    ProcessorResp::Finish => break ConnExitStatus::Finish,
-                }
-            };
-            exit_status
-        });
+            match resp {
+                ProcessorResp::Continue => continue,
+                ProcessorResp::ContinueWith(resp_msg) => {
+                    ws_tx.send(resp_msg).await.ok();
+                    continue;
+                },
+                ProcessorResp::Reconnect => break ConnExitStatus::Reconnect(cmd_rx),
+                ProcessorResp::Finish => break ConnExitStatus::Finish,
+            }
+        };
+        exit_status
+    });
 
-        ping_task_handle.then(|_| conn_task_handle)
+    Conn {
+        close_tx,
+        task_fut: ping_task_handle.then(|_| conn_task_handle),
     }
 }
 
