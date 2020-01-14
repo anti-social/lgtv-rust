@@ -31,15 +31,132 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cmd::{PointerCmd, TvCmd};
 
-#[derive(Clone)]
-pub(crate) struct PersistentConn {
+struct InnerConn {
+    url: Url,
     client_key: String,
     connect_timeout: Option<Duration>,
-    read_timeout: Option<Duration>,
-    wait_conn_tx: mpsc::Sender<oneshot::Sender<()>>,
+    cmd_rx: mpsc::Receiver<TvCmd>,
+    pointer_cmd_rx: mpsc::Receiver<PointerCmd>,
+    is_connected: Arc<AtomicBool>,
+}
+
+struct OuterConn {
     cmd_tx: mpsc::Sender<TvCmd>,
     pointer_cmd_tx: mpsc::Sender<PointerCmd>,
     is_connected: Arc<AtomicBool>,
+}
+
+fn create_conn_parts(
+    url: Url,
+    client_key: String,
+    connect_timeout: Option<Duration>,
+) -> (InnerConn, OuterConn) {
+    let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    let (pointer_cmd_tx, pointer_cmd_rx) = mpsc::channel(1);
+    let is_connected = Arc::new(AtomicBool::new(false));
+    (
+        InnerConn {
+            url,
+            client_key,
+            connect_timeout,
+            cmd_rx,
+            pointer_cmd_rx,
+            is_connected: is_connected.clone(),
+        },
+        OuterConn {
+            cmd_tx,
+            pointer_cmd_tx,
+            is_connected,
+        },
+    )
+}
+
+impl InnerConn {
+    async fn connect_and_wait(mut self) -> Result<ConnExitStatus<Self>, Self> {
+        let ws_stream = match self.connect().await {
+            Ok(ws_stream) => {
+                info!("Connected to {}", &self.url);
+                ws_stream
+            },
+            Err(e) => {
+                info!("Connection error: {}", e);
+                return Err(self);
+            }
+        };
+
+        let main_conn_processor = MainConnProcessor::new();
+        let (ws_tx, _ws_rx) = ws_stream.split();
+        let ws_rx = _ws_rx.fuse();
+
+        // We should start a connection before pairing with TV
+        let main_conn = start_conn(
+            main_conn_processor, ws_tx, ws_rx, self.cmd_rx
+        );
+
+        match self.pair().await {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Error when pairing: {}", e);
+                task::sleep(Duration::from_secs(10)).await;
+                main_conn.close().await.ok();
+            }
+        }
+
+
+
+        self.cmd_rx = match main_conn.task_fut.await {
+            ConnExitStatus::Reconnect(cmd_rx) => {
+                info!("Disconnected. Trying to reconnect ...");
+                self.is_connected.store(false, Ordering::Relaxed);
+                cmd_rx
+            },
+            ConnExitStatus::Finish => {
+                return Ok(ConnExitStatus::Finish);
+            }
+        };
+
+        Ok(ConnExitStatus::Reconnect(self))
+    }
+
+    async fn connect(&self) -> Result<WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>, Error> {
+        let (ws_stream, _) = if let Some(conn_timeout) = self.connect_timeout {
+            timeout(conn_timeout, connect_async(self.url.clone())).await??
+        } else {
+            connect_async(self.url.clone()).await?
+        };
+        Ok(ws_stream)
+    }
+
+    async fn pair(&self) -> Result<(), Error> {
+        self.send_cmd_inner(TvCmd::register(self.client_key.clone())).await
+    }
+
+    async fn send_cmd_inner<T>(
+        &self,
+        rx_fut_and_cmd: (impl Future<Output = Result<Result<T, Error>, oneshot::Canceled>>, TvCmd)
+    ) -> Result<T, Error> {
+        let mut cmd_tx = self.outer.cmd_tx.clone();
+        let (cmd_res_rx, cmd) = rx_fut_and_cmd;
+        let res_fut = async {
+            cmd_tx.send(cmd).await.ok();
+            cmd_res_rx.await
+        };
+        let res = if let Some(read_timeout) = self.read_timeout {
+            timeout(read_timeout, res_fut).await?
+        } else {
+            res_fut.await
+        };
+        res.map_err(|e| format_err!("Canceled channel: {}", e))?
+    }
+}
+
+// #[derive(Clone)]
+pub(crate) struct PersistentConn {
+//    client_key: String,
+//    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    wait_conn_tx: mpsc::Sender<oneshot::Sender<()>>,
+    outer: OuterConn,
 }
 
 impl PersistentConn {
@@ -49,108 +166,113 @@ impl PersistentConn {
         connect_timeout: Option<Duration>,
         read_timeout: Option<Duration>,
     ) -> PersistentConn {
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
-        let (pointer_cmd_tx, mut pointer_cmd_rx) = mpsc::channel(1);
         let (wait_conn_tx, mut wait_conn_rx) = mpsc::channel(1);
-        let is_connected = Arc::new(AtomicBool::new(false));
-        let (is_connected_tx, is_connected_rx) = (is_connected.clone(), is_connected.clone());
+        let (mut inner_conn, outer_conn) = create_conn_parts(url, client_key, connect_timeout);
 
         let conn = PersistentConn {
-            client_key,
-            connect_timeout,
+//            client_key,
+//            connect_timeout,
             read_timeout,
             wait_conn_tx,
-            cmd_tx,
-            pointer_cmd_tx,
-            is_connected,
+            outer: outer_conn,
         };
-        let conn_ret = conn.clone();
 
         let conn_waiters_tx = Arc::new(Mutex::new(
             Vec::<oneshot::Sender<()>>::new()
         ));
         let conn_waiters_rx = conn_waiters_tx.clone();
+        let is_connected = inner_conn.is_connected.clone();
 
         task::spawn(async move {
             trace!("Starting persistent connection loop ...");
             loop {
-                trace!("Connecting to {} ...", &url);
-                let conn_res = PersistentConn::connect(url.clone(), connect_timeout).await;
-                let ws_stream = match conn_res {
-                    Ok(ws_stream) => {
-                        info!("Connected to {}", &url);
-                        ws_stream
-                    },
-                    Err(e) => {
-                        info!("Connection error: {}", e);
-                        task::sleep(Duration::from_secs(10)).await;
-                        continue;
+//                trace!("Connecting to {} ...", &inner_conn.url);
+                inner_conn = match inner_conn.connect_and_wait().await {
+                    Ok(ConnExitStatus::Reconnect(c)) => c,
+                    Ok(ConnExitStatus::Finish) => {
+                        break;
+                    }
+                    Err(c) => {
+                        c
                     },
                 };
 
-                let main_conn_processor = MainConnProcessor::new();
-                let (ws_tx, _ws_rx) = ws_stream.split();
-                let ws_rx = _ws_rx.fuse();
-
-                // We should start a connection before pairing with TV
-                let main_conn = start_conn(
-                    main_conn_processor, ws_tx, ws_rx, cmd_rx
-                );
-
-                match conn.pair().await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("Error when pairing: {}", e);
-                        task::sleep(Duration::from_secs(10)).await;
-                        main_conn.close().await.ok();
-                    }
-                }
-
-                let pointer_url = match conn.get_pointer_input_url().await {
-                    Ok(url) => url,
-                    Err(e) => {
-                        warn!("Error when receiving pointer websocket url: {}", e);
-                        task::sleep(Duration::from_secs(10)).await;
-                        main_conn.close().await.ok();
-                        continue;
-                    }
-                };
-                let pointer_ws_stream = match PersistentConn::connect(pointer_url.clone(), connect_timeout).await {
-                    Ok(ws_stream) => ws_stream,
-                    Err(e) => {
-                        warn!("Cannot connect to pointer: {}", e);
-                        task::sleep(Duration::from_secs(10)).await;
-                        main_conn.close().await.ok();
-                        continue;
-                    }
-                };
-                let (pointer_ws_tx, _pointer_ws_rx) = pointer_ws_stream.split();
-                let pointer_ws_rx = _pointer_ws_rx.fuse();
-                let pointer_conn_processor = PointerConnProcessor::new();
-                let pointer_conn = start_conn(
-                    pointer_conn_processor, pointer_ws_tx, pointer_ws_rx, pointer_cmd_rx
-                );
-
-                // Notify all who waits for connection
-                let mut conn_waiters = conn_waiters_rx.lock().await;
-                is_connected_tx.store(true, Ordering::Relaxed);
-                for conn_waiter in (*conn_waiters).drain(..) {
-                    conn_waiter.send(()).ok();
-                }
-
-                cmd_rx = match main_conn.task_fut.await {
-                    ConnExitStatus::Reconnect(cmd_rx) => {
-                        info!("Disconnected. Trying to reconnect ...");
-                        is_connected_tx.store(false, Ordering::Relaxed);
-                        cmd_rx
-                    },
-                    ConnExitStatus::Finish => break,
-                };
-
-                pointer_cmd_rx = match pointer_conn.task_fut.await {
-                    ConnExitStatus::Reconnect(cmd_rx) => cmd_rx,
-                    ConnExitStatus::Finish => break,
-                };
+//                let conn_res = PersistentConn::connect(url.clone(), connect_timeout).await;
+//                let ws_stream = match conn_res {
+//                    Ok(ws_stream) => {
+//                        info!("Connected to {}", &url);
+//                        ws_stream
+//                    },
+//                    Err(e) => {
+//                        info!("Connection error: {}", e);
+//                        task::sleep(Duration::from_secs(10)).await;
+//                        continue;
+//                    },
+//                };
+//
+//                let main_conn_processor = MainConnProcessor::new();
+//                let (ws_tx, _ws_rx) = ws_stream.split();
+//                let ws_rx = _ws_rx.fuse();
+//
+//                // We should start a connection before pairing with TV
+//                let main_conn = start_conn(
+//                    main_conn_processor, ws_tx, ws_rx, cmd_rx
+//                );
+//
+//                match conn.pair().await {
+//                    Ok(_) => {}
+//                    Err(e) => {
+//                        warn!("Error when pairing: {}", e);
+//                        task::sleep(Duration::from_secs(10)).await;
+//                        main_conn.close().await.ok();
+//                    }
+//                }
+//
+//                let pointer_url = match conn.get_pointer_input_url().await {
+//                    Ok(url) => url,
+//                    Err(e) => {
+//                        warn!("Error when receiving pointer websocket url: {}", e);
+//                        task::sleep(Duration::from_secs(10)).await;
+//                        main_conn.close().await.ok();
+//                        continue;
+//                    }
+//                };
+//                let pointer_ws_stream = match PersistentConn::connect(pointer_url.clone(), connect_timeout).await {
+//                    Ok(ws_stream) => ws_stream,
+//                    Err(e) => {
+//                        warn!("Cannot connect to pointer: {}", e);
+//                        task::sleep(Duration::from_secs(10)).await;
+//                        main_conn.close().await.ok();
+//                        continue;
+//                    }
+//                };
+//                let (pointer_ws_tx, _pointer_ws_rx) = pointer_ws_stream.split();
+//                let pointer_ws_rx = _pointer_ws_rx.fuse();
+//                let pointer_conn_processor = PointerConnProcessor::new();
+//                let pointer_conn = start_conn(
+//                    pointer_conn_processor, pointer_ws_tx, pointer_ws_rx, pointer_cmd_rx
+//                );
+//
+//                // Notify all who waits for connection
+//                let mut conn_waiters = conn_waiters_rx.lock().await;
+//                is_connected_tx.store(true, Ordering::Relaxed);
+//                for conn_waiter in (*conn_waiters).drain(..) {
+//                    conn_waiter.send(()).ok();
+//                }
+//
+//                cmd_rx = match main_conn.task_fut.await {
+//                    ConnExitStatus::Reconnect(cmd_rx) => {
+//                        info!("Disconnected. Trying to reconnect ...");
+//                        is_connected_tx.store(false, Ordering::Relaxed);
+//                        cmd_rx
+//                    },
+//                    ConnExitStatus::Finish => break,
+//                };
+//
+//                pointer_cmd_rx = match pointer_conn.task_fut.await {
+//                    ConnExitStatus::Reconnect(cmd_rx) => cmd_rx,
+//                    ConnExitStatus::Finish => break,
+//                };
             }
             trace!("Finished persistent connection loop ...");
         });
@@ -160,7 +282,7 @@ impl PersistentConn {
                 match wait_conn_rx.next().await {
                     Some(ch) => {
                         let mut conn_waiters = conn_waiters_tx.lock().await;
-                        if is_connected_rx.load(Ordering::Relaxed) {
+                        if is_connected.load(Ordering::Relaxed) {
                             ch.send(()).ok();
                         } else {
                             (*conn_waiters).push(ch);
@@ -171,11 +293,26 @@ impl PersistentConn {
             }
         });
 
-        conn_ret
+        conn
+    }
+
+    async fn connect(
+        url: Url, connect_timeout: Option<Duration>
+    ) -> Result<WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>, Error> {
+        let (ws_stream, _) = if let Some(conn_timeout) = connect_timeout {
+            timeout(conn_timeout, connect_async(url.clone())).await??
+        } else {
+            connect_async(url.clone()).await?
+        };
+        Ok(ws_stream)
+    }
+
+    async fn connect_and_wait() {
+
     }
 
     pub fn is_connected(&self) -> bool {
-        self.is_connected.load(Ordering::Relaxed)
+        self.outer.is_connected.load(Ordering::Relaxed)
     }
 
     pub async fn wait(&self) {
@@ -198,7 +335,7 @@ impl PersistentConn {
         &self,
         rx_fut_and_cmd: (impl Future<Output = Result<Result<T, Error>, oneshot::Canceled>>, TvCmd)
     ) -> Result<T, Error> {
-        let mut cmd_tx = self.cmd_tx.clone();
+        let mut cmd_tx = self.outer.cmd_tx.clone();
         let (cmd_res_rx, cmd) = rx_fut_and_cmd;
         let res_fut = async {
             cmd_tx.send(cmd).await.ok();
@@ -218,29 +355,18 @@ impl PersistentConn {
         if !self.is_connected() {
             return Err(format_err!("Not connected"));
         }
-        let mut cmd_tx = self.pointer_cmd_tx.clone();
+        let mut cmd_tx = self.outer.pointer_cmd_tx.clone();
         cmd_tx.send(cmd).await.ok();
         Ok(())
     }
 
-    async fn connect(
-        url: Url, connect_timeout: Option<Duration>
-    ) -> Result<WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>, Error> {
-        let (ws_stream, _) = if let Some(conn_timeout) = connect_timeout {
-            timeout(conn_timeout, connect_async(url.clone())).await??
-        } else {
-            connect_async(url.clone()).await?
-        };
-        Ok(ws_stream)
-    }
-
-    async fn pair(&self) -> Result<(), Error> {
-        self.send_cmd_inner(TvCmd::register(self.client_key.clone())).await
-    }
-
-    async fn get_pointer_input_url(&self) -> Result<Url, Error> {
-        self.send_cmd_inner(TvCmd::get_pointer_input_socket()).await
-    }
+//    async fn pair(&self) -> Result<(), Error> {
+//        self.send_cmd_inner(TvCmd::register(self.client_key.clone())).await
+//    }
+//
+//    async fn get_pointer_input_url(&self) -> Result<Url, Error> {
+//        self.send_cmd_inner(TvCmd::get_pointer_input_socket()).await
+//    }
 }
 
 enum ConnExitStatus<T> {
